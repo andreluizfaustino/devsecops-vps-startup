@@ -143,11 +143,11 @@ detect_local_ip() {
 
 show_header() {
     echo -e "${CYAN}"
-    echo "╔═══════════════════════════════════════════════════════════════════╗"
-    echo "║ PostgreSQL Cluster Management Tool                                ║"
-    echo "║ Versão: ${SCRIPT_VERSION}                                                      ║"
-    echo "║ Autor: https://github.com/andreluizfaustino                       ║"
-    echo "╚═══════════════════════════════════════════════════════════════════╝"
+    echo "╔══════════════════════════════════════════════════════════╗"
+    echo "║ PostgreSQL Cluster Management Tool                       ║"
+    echo "║ Versão: ${SCRIPT_VERSION}                                              ║"
+    echo "║ Autor: https://github.com/andreluizfaustino              ║"
+    echo "╚══════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
 
