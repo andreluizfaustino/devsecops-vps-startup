@@ -3314,13 +3314,10 @@ setup_primary_for_replication() {
     while [ $waited -lt $max_wait ]; do
         # Verificar se o cluster está online primeiro
         if pg_lsclusters -h | grep "^$pg_version.*$primary_cluster" | grep -q "online"; then
-            # Tentar conectar via Unix socket (mais rápido e confiável)
-            if sudo -u postgres psql -p $primary_port -c "SELECT 1" >/dev/null 2>&1; then
-                # Agora testar conexão de replicação via rede
-                if sudo -u postgres PGPASSWORD="$replicator_password" psql -h $tailscale_ip -p $primary_port -U replicator -d postgres -c "IDENTIFY_SYSTEM" >/dev/null 2>&1; then
-                    print_success "PRIMARY configurado e aceitando conexões de replicação!"
-                    break
-                fi
+            # Testar conexão de replicação via rede
+            if PGPASSWORD="$replicator_password" psql -h $tailscale_ip -p $primary_port -U replicator -d postgres -c "IDENTIFY_SYSTEM" >/dev/null 2>&1; then
+                print_success "PRIMARY configurado e aceitando conexões de replicação!"
+                break
             fi
         fi
         sleep 2
@@ -3355,7 +3352,7 @@ setup_standby_for_replication() {
     
     # pg_basebackup com PGPASSWORD
     print_info "Copiando dados do PRIMARY (pg_basebackup)..."
-    sudo -u postgres PGPASSWORD="$replicator_password" pg_basebackup -h $tailscale_ip -p $primary_port -U replicator -D "$standby_datadir" -Fp -Xs -P -R
+    sudo -u postgres bash -c "PGPASSWORD='$replicator_password' pg_basebackup -h $tailscale_ip -p $primary_port -U replicator -D '$standby_datadir' -Fp -Xs -P -R"
     
     if [ $? -ne 0 ]; then
         print_error "Falha no pg_basebackup!"
