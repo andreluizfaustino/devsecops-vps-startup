@@ -746,9 +746,13 @@ NET_CONF
         log WARNING "BBR não disponível (kernel < 4.9) - usando CUBIC"
     fi
     
+    # Garantir que nf_conntrack carrega no boot ANTES do sysctl
+    log INFO "Configurando nf_conntrack para carregar no boot..."
+    echo "nf_conntrack" > /etc/modules-load.d/nf_conntrack.conf
+    modprobe nf_conntrack 2>/dev/null || true
+
     # Configurar conntrack (Camada 3 — proteção contra DDoS por esgotamento de tabela)
     log INFO "Configurando conntrack (nf_conntrack)..."
-    modprobe nf_conntrack 2>/dev/null || true
     if [ -d /proc/sys/net/netfilter ]; then
         cat > /etc/sysctl.d/60-conntrack.conf << 'CONNTRACK_CONF'
 # ════════════════════════════════════════════════════════
@@ -1638,16 +1642,16 @@ phase_kernel_modules() {
 # Protocolos de rede não utilizados em servidores
 install dccp /bin/true
 install sctp /bin/true
-install rds  /bin/true
+install rds /bin/true
 install tipc /bin/true
 
 # Filesystems raramente usados em ambientes de servidor
-install cramfs  /bin/true
+install cramfs /bin/true
 install freevxfs /bin/true
-install jffs2   /bin/true
-install hfs     /bin/true
+install jffs2 /bin/true
+install hfs /bin/true
 install hfsplus /bin/true
-install udf     /bin/true
+install udf /bin/true
 MOD_CONF
 
     # Recarregar initramfs para garantir aplicação no próximo boot

@@ -196,7 +196,7 @@ check_kernel_modules() {
 
     local modules=("dccp" "sctp" "rds" "tipc" "cramfs" "jffs2" "hfs" "hfsplus" "udf")
     for mod in "${modules[@]}"; do
-        if grep -q "install $mod /bin/true" /etc/modprobe.d/blacklist-hardening.conf 2>/dev/null; then
+        if grep -qE "install[[:space:]]+${mod}[[:space:]]+/bin/true" /etc/modprobe.d/blacklist-hardening.conf 2>/dev/null; then
             # Verifica se não está carregado
             if ! lsmod 2>/dev/null | grep -q "^${mod} "; then
                 log_result PASS "Módulo bloqueado: $mod"
@@ -535,22 +535,52 @@ check_logging() {
 check_security_exposure() {
     section "Exposição de Portas (verificação extra)"
 
-    # Portas escutando em 0.0.0.0 que não deveriam estar
-    local exposed_ports
-    exposed_ports=$(ss -tlnp 2>/dev/null | grep "0.0.0.0:\|:::"\
-        | grep -v "127.0.0.1\|tailscale\|:80 \|:443 " \
-        | awk '{print $4}' | sort -u)
+    # Coletar IPs do Tailscale para exclusão
+    local ts_ips
+    ts_ips=$(tailscale ip 2>/dev/null | tr '\n' '|' | sed 's/|$//')
 
+    # Portas escutando em 0.0.0.0 ou IP público (excluindo Tailscale, loopback e portas esperadas)
+    local public_ip_check
+    public_ip_check=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || echo "")
+
+    local exposed_ports
+    exposed_ports=$(ss -tlnp 2>/dev/null \
+        | awk '{print $4}' \
+        | grep -E '^[0-9]' \
+        | grep -v '^127\.' \
+        | grep -v '^\[::1\]' \
+        | sort -u)
+
+    local found_unexpected=0
     if [ -n "$exposed_ports" ]; then
-        while IFS= read -r port; do
-            local port_num="${port##*:}"
-            # Ignorar portas esperadas
+        while IFS= read -r addr; do
+            local port_num="${addr##*:}"
+            local ip_part="${addr%:*}"
+
+            # Ignorar portas HTTP/HTTPS (esperadas do Cloudflare)
             case "$port_num" in
                 80|443) continue ;;
             esac
-            log_result WARN "Porta exposta publicamente" "($port — verifique se é intencional)"
+
+            # Ignorar IPs do Tailscale
+            if [ -n "$ts_ips" ] && echo "$ip_part" | grep -qE "$(echo "$ts_ips" | sed 's/|/\\|/g')"; then
+                continue
+            fi
+
+            # Ignorar endereços apenas de loopback/link-local
+            if echo "$ip_part" | grep -qE '^127\.|^169\.254\.|^\[fe80'; then
+                continue
+            fi
+
+            # Porta em 0.0.0.0 ou IP público = potencialmente exposta
+            if [ "$ip_part" = "0.0.0.0" ] || [ "$ip_part" = "*" ] || [ "$ip_part" = "$public_ip_check" ]; then
+                log_result WARN "Porta exposta publicamente" "($addr — verifique se UFW bloqueia)"
+                found_unexpected=1
+            fi
         done <<< "$exposed_ports"
-    else
+    fi
+
+    if [ "$found_unexpected" -eq 0 ]; then
         log_result PASS "Nenhuma porta inesperada exposta publicamente"
     fi
 
@@ -560,7 +590,8 @@ check_security_exposure() {
     if [ -n "$public_ip" ]; then
         local ssh_port
         ssh_port=$(grep "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "22")
-        if ss -tlnp 2>/dev/null | grep ":${ssh_port}" | grep -q "$public_ip\|0\.0\.0\.0"; then
+        # Verifica apenas a coluna de endereço local (4ª coluna), não o peer
+        if ss -tlnp 2>/dev/null | awk '{print $4}' | grep -q "^${public_ip}:${ssh_port}$\|^0\.0\.0\.0:${ssh_port}$"; then
             log_result FAIL "SSH exposto no IP público" "(IP: $public_ip porta: $ssh_port)"
         else
             log_result PASS "SSH não exposto no IP público" "(IP público: $public_ip)"
