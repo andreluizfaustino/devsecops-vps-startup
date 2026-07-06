@@ -352,7 +352,8 @@ check_firewall() {
 
     # Regras Cloudflare no UFW
     local cf_rules
-    cf_rules=$(ufw status 2>/dev/null | grep -c "Cloudflare" || echo 0)
+    cf_rules=$(ufw status 2>/dev/null | grep -c "Cloudflare" 2>/dev/null)
+    cf_rules=${cf_rules:-0}
     if [ "${cf_rules:-0}" -gt 0 ]; then
         log_result PASS "Regras Cloudflare no UFW" "(${cf_rules} regras ativas)"
         log_result PASS "Cloudflare IP Updater" "(execute cloudflare-update-ufw.sh para sincronizar)"
