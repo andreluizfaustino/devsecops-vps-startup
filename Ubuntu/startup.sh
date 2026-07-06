@@ -36,8 +36,6 @@ TAILSCALE_IPV6=""
 CLOUDFLARE_ONLY=""
 INSTALL_CROWDSEC=""
 INSTALL_MOD_BLOCK=""
-INSTALL_DOCKER=""
-INSTALL_MONITORING=""
 
 # Cores para output
 COLOR_RESET='\033[0m'
@@ -49,7 +47,7 @@ COLOR_CYAN='\033[0;36m'
 COLOR_BOLD='\033[1m'
 
 # Total de fases (19 fases)
-TOTAL_PHASES=20
+TOTAL_PHASES=18
 
 # Tempo inicial do script
 START_TIME=$(date +%s)
@@ -381,32 +379,6 @@ interactive_config() {
     INSTALL_MOD_BLOCK=${INSTALL_MOD_BLOCK:-S}
     echo ""
 
-    # Docker
-    echo -e "${COLOR_BOLD}[8] Docker${COLOR_RESET} (necessário para Netdata e seus serviços: Portainer, Coolify, Traefik)"
-    echo "    • Instala Docker Engine via script oficial (get.docker.com)"
-    echo "    • Adiciona usuário $SSH_USER ao grupo docker"
-    echo "    • Tempo: ~3 min"
-    read -p "    Instalar? [S/n]: " INSTALL_DOCKER
-    INSTALL_DOCKER=${INSTALL_DOCKER:-S}
-    echo ""
-
-    # Netdata (encadeado ao Docker)
-    INSTALL_MONITORING="N"
-    if [[ "$INSTALL_DOCKER" =~ ^[Ss]$ ]]; then
-        echo -e "${COLOR_BOLD}[8b] Netdata${COLOR_RESET} (monitoramento completo — requer Docker acima)"
-        echo "    • Host:    CPU, RAM, disco, rede, processos (via /proc e /sys)"
-        echo "    • Docker:  métricas de todos os containers (nativo via docker.sock)"
-        echo "    • Traefik: integração nativa automática"
-        echo "    • UI:      http://<IP_Tailscale>:19999 (porta protegida pelo UFW)"
-        echo "    • Tempo:   ~2 min (download da imagem)"
-        read -p "    Instalar? [S/n]: " INSTALL_MONITORING
-        INSTALL_MONITORING=${INSTALL_MONITORING:-S}
-        echo ""
-    else
-        log INFO "Netdata pulado (Docker não será instalado)"
-        echo ""
-    fi
-
     echo -e "${COLOR_GREEN}────────────────────────────────────────────────────────${COLOR_RESET}"
     echo "Resumo de componentes opcionais:"
     [[ "$INSTALL_UPGRADES" =~ ^[Ss]$ ]] && echo "  ✅ Unattended Upgrades" || echo "  ⏭️  Unattended Upgrades (pulado)"
@@ -415,10 +387,6 @@ interactive_config() {
     [[ "$CLOUDFLARE_ONLY" =~ ^[Ss]$ ]] && echo "  ✅ Modo Cloudflare-Only" || echo "  ⏭️  Cloudflare-Only (desativado — 80/443 público)"
     [[ "$INSTALL_CROWDSEC" =~ ^[Ss]$ ]] && echo "  ✅ CrowdSec" || echo "  ⏭️  CrowdSec (pulado)"
     [[ "$INSTALL_MOD_BLOCK" =~ ^[Ss]$ ]] && echo "  ✅ Bloqueio de Módulos de Kernel" || echo "  ⏭️  Bloqueio de Módulos (pulado)"
-    [[ "$INSTALL_DOCKER" =~ ^[Ss]$ ]] && echo "  ✅ Docker Engine" || echo "  ⏭️  Docker (pulado)"
-    if [[ "$INSTALL_DOCKER" =~ ^[Ss]$ ]]; then
-        [[ "$INSTALL_MONITORING" =~ ^[Ss]$ ]] && echo "  ✅ Netdata (monitoramento completo)" || echo "  ⏭️  Netdata (pulado)"
-    fi
     echo -e "${COLOR_GREEN}────────────────────────────────────────────────────────${COLOR_RESET}"
     echo ""
     
@@ -439,8 +407,6 @@ INSTALL_LOGGING="${INSTALL_LOGGING}"
 CLOUDFLARE_ONLY="${CLOUDFLARE_ONLY}"
 INSTALL_CROWDSEC="${INSTALL_CROWDSEC}"
 INSTALL_MOD_BLOCK="${INSTALL_MOD_BLOCK}"
-INSTALL_DOCKER="${INSTALL_DOCKER}"
-INSTALL_MONITORING="${INSTALL_MONITORING}"
 EOF
     chmod 600 "${SCRIPT_DIR}/.startup-config"
 }
@@ -1487,50 +1453,6 @@ AUDIT_RULES
 # FASE: DOCKER
 # ════════════════════════════════════════════════════════
 
-phase_docker() {
-    local PHASE="docker"
-    if is_phase_completed "$PHASE"; then
-        log INFO "Fase '$PHASE' já concluída. Pulando..."
-        return 0
-    fi
-
-    log PHASE "Instalando Docker Engine"
-    local phase_start=$(date +%s)
-
-    log INFO "Instalando Docker via script oficial (get.docker.com)..."
-    if curl -fsSL https://get.docker.com | sh >> "$LOG_FILE" 2>&1; then
-        log SUCCESS "Docker instalado com sucesso"
-    else
-        log ERROR "Falha ao instalar Docker"
-        exit 1
-    fi
-
-    # Adicionar usuário ao grupo docker (evita precisar de sudo para cada comando)
-    if [ -n "$SSH_USER" ] && [ "$SSH_USER" != "root" ]; then
-        usermod -aG docker "$SSH_USER" 2>&1 | tee -a "$LOG_FILE"
-        log SUCCESS "Usuário $SSH_USER adicionado ao grupo docker"
-        log INFO    "  ⚠️  Para aplicar sem reboot: newgrp docker (ou reconectar)"
-    fi
-
-    systemctl enable docker  2>&1 | tee -a "$LOG_FILE"
-    systemctl start  docker  2>&1 | tee -a "$LOG_FILE"
-
-    if docker info &>/dev/null; then
-        log SUCCESS "Docker Engine rodando:"
-        docker version --format 'Engine: {{.Server.Version}}' 2>/dev/null | tee -a "$LOG_FILE" || true
-    else
-        log ERROR "Docker instalado mas não está respondendo"
-        exit 1
-    fi
-
-    local phase_end=$(date +%s)
-    local phase_duration=$((phase_end - phase_start))
-    log SUCCESS "Fase concluída em $(format_time $phase_duration) | Tempo total: $(get_elapsed_time)"
-
-    mark_phase_completed "$PHASE"
-    show_progress
-}
-
 phase_logging() {
     local PHASE="logging"
     if is_phase_completed "$PHASE"; then
@@ -1663,87 +1585,6 @@ MOD_CONF
     log SUCCESS "  • Protocolos de rede: dccp, sctp, rds, tipc"
     log SUCCESS "  • Filesystems desnecessários: cramfs, freevxfs, jffs2, hfs, hfsplus, udf"
     log WARNING "  ⚠️  Efeito total após reboot (será feito automaticamente ao final)"
-
-    local phase_end=$(date +%s)
-    local phase_duration=$((phase_end - phase_start))
-    log SUCCESS "Fase concluída em $(format_time $phase_duration) | Tempo total: $(get_elapsed_time)"
-
-    mark_phase_completed "$PHASE"
-    show_progress
-}
-
-# ════════════════════════════════════════════════════════
-# FASE: MONITORAMENTO
-# ════════════════════════════════════════════════════════
-
-phase_monitoring() {
-    local PHASE="monitoring"
-    if is_phase_completed "$PHASE"; then
-        log INFO "Fase '$PHASE' já concluída. Pulando..."
-        return 0
-    fi
-
-    log PHASE "Instalando Netdata (monitoramento: host + Docker em 1 container)"
-    local phase_start=$(date +%s)
-
-    NETDATA_DIR="/opt/netdata"
-    mkdir -p "$NETDATA_DIR"
-
-    # Docker Compose — Netdata cobre host + Docker + Traefik em 1 container
-    cat > "$NETDATA_DIR/docker-compose.yml" << 'NETDATA_COMPOSE'
-version: '3.8'
-
-services:
-  netdata:
-    image: netdata/netdata:latest
-    container_name: netdata
-    restart: unless-stopped
-    pid: host
-    network_mode: host
-    cap_add:
-      - SYS_PTRACE
-      - SYS_ADMIN
-    security_opt:
-      - apparmor:unconfined
-    volumes:
-      - netdata_config:/etc/netdata
-      - netdata_lib:/var/lib/netdata
-      - netdata_cache:/var/cache/netdata
-      - /:/host/root:ro,rslave
-      - /etc/passwd:/host/etc/passwd:ro
-      - /etc/group:/host/etc/group:ro
-      - /proc:/host/proc:ro
-      - /sys:/host/sys:ro
-      - /etc/os-release:/host/etc/os-release:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    environment:
-      - DOCKER_HOST=unix:///var/run/docker.sock
-
-volumes:
-  netdata_config: {}
-  netdata_lib: {}
-  netdata_cache: {}
-NETDATA_COMPOSE
-
-    log INFO "Iniciando Netdata (download da imagem pode demorar)..."
-    cd "$NETDATA_DIR" && docker compose up -d >> "$LOG_FILE" 2>&1
-
-    sleep 5
-
-    if docker ps 2>/dev/null | grep -q "netdata"; then
-        log SUCCESS "Netdata iniciado com sucesso!"
-        log SUCCESS "  • Host:    CPU, RAM, disco, rede, processos (via /proc e /sys)"
-        log SUCCESS "  • Docker:  métricas de todos os containers (via docker.sock)"
-        log SUCCESS "  • Traefik: integração nativa (ativa automaticamente)"
-        log SUCCESS "  • UI:      http://${TAILSCALE_IPV4}:19999 (acesso via Tailscale)"
-        log WARNING "  ⚠️  Porta 19999 protegida pelo UFW — acessível APENAS via Tailscale"
-        log INFO    "  • Arquivos em: $NETDATA_DIR"
-        log INFO    "  • Dados persistidos em volumes Docker: netdata_config, netdata_lib, netdata_cache"
-    else
-        log WARNING "Netdata pode não ter iniciado corretamente"
-        log INFO    "  Verifique: docker compose -f $NETDATA_DIR/docker-compose.yml ps"
-        log INFO    "  Logs: docker compose -f $NETDATA_DIR/docker-compose.yml logs"
-    fi
 
     local phase_end=$(date +%s)
     local phase_duration=$((phase_end - phase_start))
@@ -1941,15 +1782,7 @@ show_summary() {
     [[ "$INSTALL_CROWDSEC" =~ ^[Ss]$ ]] && echo "    • CrowdSec: ATIVO (escopo: HTTP/bots/scanners)"
     [[ "$INSTALL_MOD_BLOCK" =~ ^[Ss]$ ]] && echo "    • Módulos kernel bloqueados: dccp, sctp, rds, tipc"
     echo ""
-    echo "  🐳 Infraestrutura:"
-    if [[ "$INSTALL_DOCKER" =~ ^[Ss]$ ]]; then
-        echo "    • Docker Engine: INSTALADO"
-        [[ "$INSTALL_MONITORING" =~ ^[Ss]$ ]] && echo "    • Netdata: ATIVO — http://${TAILSCALE_IPV4}:19999"
-    else
-        echo "    • Docker: não instalado"
-    fi
-    echo ""
-    echo "  📋 Logs: /var/log/"
+    echo "   Logs: /var/log/"
     echo ""
     echo -e "${COLOR_BOLD}════════════════════════════════════════════════════════${COLOR_RESET}"
     echo -e "${COLOR_BOLD}  ⚠️  IMPORTANTE: Anote estas informações!${COLOR_RESET}"
@@ -1966,13 +1799,6 @@ show_summary() {
         echo "    • HTTPS: https://SEU_IP_PUBLICO"
     fi
     echo ""
-    if [[ "$INSTALL_MONITORING" =~ ^[Ss]$ ]]; then
-        echo "  📊 Monitoramento Netdata (via Tailscale):"
-        echo "    • UI:    http://${TAILSCALE_IPV4}:19999"
-        echo "    • Cobre: servidor, Docker containers e Traefik"
-        echo "    • Dados: /opt/netdata/"
-        echo ""
-    fi
     if [[ "$CLOUDFLARE_ONLY" =~ ^[Ss]$ ]]; then
         echo "  🔄 Cloudflare IP Updater:"
         echo "    • Timer: semanal (toda segunda-feira ±1h)"
@@ -2015,12 +1841,6 @@ Sistema:
 Segurança:
   • Fail2Ban: Ativo
   • Auditd: $([ "$INSTALL_AUDITD" = "S" ] && echo "Ativo" || echo "Desativado")
-
-Infraestrutura:
-  • Docker: $([[ "$INSTALL_DOCKER" =~ ^[Ss]$ ]] && echo "Instalado" || echo "Não instalado")
-
-Monitoramento:
-  • Netdata: $([ "$INSTALL_MONITORING" = "S" ] && echo "Ativo — http://${TAILSCALE_IPV4}:19999" || echo "Desativado")
 
 Logs do script:
   • $LOG_FILE
@@ -2147,21 +1967,6 @@ main() {
         mark_phase_completed "logging"
     fi
 
-    if [[ "$INSTALL_DOCKER" =~ ^[Ss]$ ]]; then
-        phase_docker
-        if [[ "$INSTALL_MONITORING" =~ ^[Ss]$ ]]; then
-            phase_monitoring
-        else
-            log INFO "⏭️  Pulando Netdata (opcional)"
-            mark_phase_completed "monitoring"
-        fi
-    else
-        log INFO "⏭️  Pulando Docker (opcional)"
-        mark_phase_completed "docker"
-        log INFO "⏭️  Pulando Netdata (Docker não instalado)"
-        mark_phase_completed "monitoring"
-    fi
-    
     # Progress bar final
     echo ""
     show_progress
