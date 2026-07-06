@@ -33,7 +33,6 @@ SWAP_SIZE=""
 PUB_KEY=""
 TAILSCALE_IPV4=""
 TAILSCALE_IPV6=""
-INSTALL_CROWDSEC=""
 INSTALL_MOD_BLOCK=""
 
 # Cores para output
@@ -45,8 +44,8 @@ COLOR_BLUE='\033[0;34m'
 COLOR_CYAN='\033[0;36m'
 COLOR_BOLD='\033[1m'
 
-# Total de fases (16 fases)
-TOTAL_PHASES=16
+# Total de fases (15 fases)
+TOTAL_PHASES=15
 
 # Tempo inicial do script
 START_TIME=$(date +%s)
@@ -347,17 +346,6 @@ interactive_config() {
     INSTALL_LOGGING=${INSTALL_LOGGING:-S}
     echo ""
 
-    # CrowdSec
-    echo -e "${COLOR_BOLD}[6] CrowdSec${COLOR_RESET} (IPS colaborativo — complementa o Fail2Ban)"
-    echo "    • Bloqueia bots, scanners, Tor, IPs maliciosos conhecidos"
-    echo "    • Aprende ataques colaborativamente com outros servidores do mundo"
-    echo "    • Bouncer iptables integrado + collections: linux, traefik, nginx"
-    echo "    • Escopo diferente do Fail2Ban: CrowdSec → HTTP/bots; Fail2Ban → SSH"
-    echo "    • Tempo: ~3 min"
-    read -p "    Instalar? [S/n]: " INSTALL_CROWDSEC
-    INSTALL_CROWDSEC=${INSTALL_CROWDSEC:-S}
-    echo ""
-
     # Kernel module blocking
     echo -e "${COLOR_BOLD}[7] Bloqueio de Módulos de Kernel${COLOR_RESET} (reduz superfície de ataque)"
     echo "    • Desabilita protocolos não utilizados: dccp, sctp, rds, tipc"
@@ -373,7 +361,6 @@ interactive_config() {
     [[ "$INSTALL_UPGRADES" =~ ^[Ss]$ ]] && echo "  ✅ Unattended Upgrades" || echo "  ⏭️  Unattended Upgrades (pulado)"
     [[ "$INSTALL_AUDITD" =~ ^[Ss]$ ]] && echo "  ✅ Auditd" || echo "  ⏭️  Auditd (pulado)"
     [[ "$INSTALL_LOGGING" =~ ^[Ss]$ ]] && echo "  ✅ Logging Avançado" || echo "  ⏭️  Logging Avançado (pulado)"
-    [[ "$INSTALL_CROWDSEC" =~ ^[Ss]$ ]] && echo "  ✅ CrowdSec" || echo "  ⏭️  CrowdSec (pulado)"
     [[ "$INSTALL_MOD_BLOCK" =~ ^[Ss]$ ]] && echo "  ✅ Bloqueio de Módulos de Kernel" || echo "  ⏭️  Bloqueio de Módulos (pulado)"
     echo -e "${COLOR_GREEN}────────────────────────────────────────────────────────${COLOR_RESET}"
     echo ""
@@ -392,7 +379,6 @@ TAILSCALE_IPV6="${TAILSCALE_IPV6}"
 INSTALL_UPGRADES="${INSTALL_UPGRADES}"
 INSTALL_AUDITD="${INSTALL_AUDITD}"
 INSTALL_LOGGING="${INSTALL_LOGGING}"
-INSTALL_CROWDSEC="${INSTALL_CROWDSEC}"
 INSTALL_MOD_BLOCK="${INSTALL_MOD_BLOCK}"
 EOF
     chmod 600 "${SCRIPT_DIR}/.startup-config"
@@ -1425,74 +1411,6 @@ EOF_LOGROTATE
 }
 
 # ════════════════════════════════════════════════════════
-# FASE: CROWDSEC
-# ════════════════════════════════════════════════════════
-
-phase_crowdsec() {
-    local PHASE="crowdsec"
-    if is_phase_completed "$PHASE"; then
-        log INFO "Fase '$PHASE' já concluída. Pulando..."
-        return 0
-    fi
-
-    log PHASE "Instalando CrowdSec (IPS colaborativo)"
-    local phase_start=$(date +%s)
-
-    log INFO "Instalando CrowdSec via script oficial..."
-    curl -s https://install.crowdsec.net | sh >> "$LOG_FILE" 2>&1
-
-    log INFO "Instalando pacote crowdsec..."
-    apt install -y -qq crowdsec >> "$LOG_FILE" 2>&1
-
-    log INFO "Instalando bouncer iptables (bloqueia IPs maliciosos em tempo real)..."
-    apt install -y -qq crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1
-
-    log INFO "Instalando collections de segurança..."
-    cscli collections install crowdsecurity/linux     >> "$LOG_FILE" 2>&1 || true
-    cscli collections install crowdsecurity/traefik   >> "$LOG_FILE" 2>&1 || true
-    cscli collections install crowdsecurity/nginx     >> "$LOG_FILE" 2>&1 || true
-
-    systemctl enable crowdsec                         2>&1 | tee -a "$LOG_FILE"
-    systemctl restart crowdsec                        2>&1 | tee -a "$LOG_FILE"
-
-    # Registrar bouncer e injetar API key antes de iniciar
-    log INFO "Registrando bouncer iptables no CrowdSec..."
-    sleep 3  # aguardar CrowdSec LAPI estar pronto
-    local bouncer_key
-    bouncer_key=$(cscli bouncers add firewall-bouncer -o raw 2>/dev/null || true)
-    if [ -n "$bouncer_key" ] && [ -f /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml ]; then
-        sed -i "s/^api_key:.*/api_key: ${bouncer_key}/" /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
-        log SUCCESS "API key do bouncer registrada"
-    else
-        log WARNING "Não foi possível registrar bouncer automaticamente — execute manualmente:"
-        log WARNING "  cscli bouncers add firewall-bouncer && systemctl restart crowdsec-firewall-bouncer"
-    fi
-
-    systemctl enable crowdsec-firewall-bouncer        2>&1 | tee -a "$LOG_FILE"
-    systemctl restart crowdsec-firewall-bouncer       2>&1 | tee -a "$LOG_FILE"
-
-    log SUCCESS "CrowdSec instalado e configurado"
-    log SUCCESS "  • Bouncer iptables: bloqueia IPs maliciosos automaticamente"
-    log SUCCESS "  • Collections ativas: linux, traefik, nginx"
-    log SUCCESS "  • Inteligência compartilhada com toda a comunidade CrowdSec"
-    log INFO    "  • Relação com Fail2Ban: escopos diferentes, sem conflito"
-    log INFO    "    - Fail2Ban  → SSH brute force (auth.log)"
-    log INFO    "    - CrowdSec  → HTTP, bots, scanners, IPs de reputação ruim"
-    log INFO    "  • Comandos úteis:"
-    log INFO    "    - cscli decisions list   (IPs bloqueados)"
-    log INFO    "    - cscli alerts list      (alertas recentes)"
-    log INFO    "    - cscli metrics          (estatísticas)"
-    log INFO    "    - cscli hub update       (atualizar threat intelligence)"
-
-    local phase_end=$(date +%s)
-    local phase_duration=$((phase_end - phase_start))
-    log SUCCESS "Fase concluída em $(format_time $phase_duration) | Tempo total: $(get_elapsed_time)"
-
-    mark_phase_completed "$PHASE"
-    show_progress
-}
-
-# ════════════════════════════════════════════════════════
 # FASE: BLOQUEIO DE MÓDULOS DE KERNEL
 # ════════════════════════════════════════════════════════
 
@@ -1603,7 +1521,6 @@ show_summary() {
     echo "  🔍 Sistemas de Detecção:"
     [[ "$INSTALL_AUDITD" =~ ^[Ss]$ ]] && echo "    • Auditd: ATIVO (otimizado)"
     echo "    • Fail2Ban: ATIVO (escopo: SSH)"
-    [[ "$INSTALL_CROWDSEC" =~ ^[Ss]$ ]] && echo "    • CrowdSec: ATIVO (escopo: HTTP/bots/scanners)"
     [[ "$INSTALL_MOD_BLOCK" =~ ^[Ss]$ ]] && echo "    • Módulos kernel bloqueados: dccp, sctp, rds, tipc"
     echo ""
     echo "   Logs: /var/log/"
@@ -1744,13 +1661,6 @@ main() {
     phase_ssh_config # Fase 10: Configurar SSH para escutar apenas no Tailscale
     phase_fail2ban
     phase_firewall_ufw # Fase 12: UFW - 80/443 (Cloudflare-only ou público) + resto via Tailscale
-
-    if [[ "$INSTALL_CROWDSEC" =~ ^[Ss]$ ]]; then
-        phase_crowdsec
-    else
-        log INFO "⏭️  Pulando CrowdSec (opcional)"
-        mark_phase_completed "crowdsec"
-    fi
 
     if [[ "$INSTALL_MOD_BLOCK" =~ ^[Ss]$ ]]; then
         phase_kernel_modules

@@ -387,41 +387,6 @@ check_fail2ban() {
     fi
 }
 
-check_crowdsec() {
-    section "CrowdSec"
-
-    if ! command -v cscli &>/dev/null; then
-        log_result WARN "CrowdSec instalado" "(não encontrado — opcional)"
-        return
-    fi
-    log_result PASS "CrowdSec instalado"
-
-    if systemctl is-active --quiet crowdsec 2>/dev/null; then
-        log_result PASS "CrowdSec serviço ativo"
-    else
-        log_result FAIL "CrowdSec serviço ativo" "(serviço parado)"
-    fi
-
-    # Bouncer iptables
-    if systemctl is-active --quiet crowdsec-firewall-bouncer 2>/dev/null; then
-        local blocked
-        blocked=$(cscli decisions list 2>/dev/null | grep -c "ban" 2>/dev/null)
-        blocked=${blocked:-0}
-        log_result PASS "Bouncer iptables ativo" "(${blocked} IPs bloqueados)"
-    else
-        log_result FAIL "Bouncer iptables ativo" "(serviço parado — IPs não estão sendo bloqueados)"
-    fi
-
-    # Collections
-    for col in "crowdsecurity/linux" "crowdsecurity/traefik" "crowdsecurity/nginx"; do
-        if cscli collections list 2>/dev/null | grep -q "$col"; then
-            log_result PASS "Collection: $col"
-        else
-            log_result WARN "Collection: $col" "(não instalada)"
-        fi
-    done
-}
-
 check_auditd() {
     section "Auditd"
 
@@ -673,7 +638,6 @@ main() {
     check_tailscale
     check_firewall
     check_fail2ban
-    check_crowdsec
     check_auditd
     check_docker
     check_netdata
