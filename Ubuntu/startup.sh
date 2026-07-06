@@ -33,7 +33,6 @@ SWAP_SIZE=""
 PUB_KEY=""
 TAILSCALE_IPV4=""
 TAILSCALE_IPV6=""
-CLOUDFLARE_ONLY=""
 INSTALL_CROWDSEC=""
 INSTALL_MOD_BLOCK=""
 
@@ -348,16 +347,6 @@ interactive_config() {
     INSTALL_LOGGING=${INSTALL_LOGGING:-S}
     echo ""
 
-    # Cloudflare-Only mode
-    echo -e "${COLOR_BOLD}[5] Modo Cloudflare-Only${COLOR_RESET} (restringe 80/443 exclusivamente aos IPs da Cloudflare)"
-    echo "    • Bloqueia scanners e ataques diretos ao IP público"
-    echo "    • HTTP/HTTPS aceitos APENAS dos ranges IPv4 e IPv6 da Cloudflare"
-    echo "    • ⚠️  Todos os domínios devem ter o proxy da Cloudflare ativo"
-    echo "    • Tempo: ~30 segundos"
-    read -p "    Ativar? [S/n]: " CLOUDFLARE_ONLY
-    CLOUDFLARE_ONLY=${CLOUDFLARE_ONLY:-S}
-    echo ""
-
     # CrowdSec
     echo -e "${COLOR_BOLD}[6] CrowdSec${COLOR_RESET} (IPS colaborativo — complementa o Fail2Ban)"
     echo "    • Bloqueia bots, scanners, Tor, IPs maliciosos conhecidos"
@@ -384,7 +373,6 @@ interactive_config() {
     [[ "$INSTALL_UPGRADES" =~ ^[Ss]$ ]] && echo "  ✅ Unattended Upgrades" || echo "  ⏭️  Unattended Upgrades (pulado)"
     [[ "$INSTALL_AUDITD" =~ ^[Ss]$ ]] && echo "  ✅ Auditd" || echo "  ⏭️  Auditd (pulado)"
     [[ "$INSTALL_LOGGING" =~ ^[Ss]$ ]] && echo "  ✅ Logging Avançado" || echo "  ⏭️  Logging Avançado (pulado)"
-    [[ "$CLOUDFLARE_ONLY" =~ ^[Ss]$ ]] && echo "  ✅ Modo Cloudflare-Only" || echo "  ⏭️  Cloudflare-Only (desativado — 80/443 público)"
     [[ "$INSTALL_CROWDSEC" =~ ^[Ss]$ ]] && echo "  ✅ CrowdSec" || echo "  ⏭️  CrowdSec (pulado)"
     [[ "$INSTALL_MOD_BLOCK" =~ ^[Ss]$ ]] && echo "  ✅ Bloqueio de Módulos de Kernel" || echo "  ⏭️  Bloqueio de Módulos (pulado)"
     echo -e "${COLOR_GREEN}────────────────────────────────────────────────────────${COLOR_RESET}"
@@ -404,7 +392,6 @@ TAILSCALE_IPV6="${TAILSCALE_IPV6}"
 INSTALL_UPGRADES="${INSTALL_UPGRADES}"
 INSTALL_AUDITD="${INSTALL_AUDITD}"
 INSTALL_LOGGING="${INSTALL_LOGGING}"
-CLOUDFLARE_ONLY="${CLOUDFLARE_ONLY}"
 INSTALL_CROWDSEC="${INSTALL_CROWDSEC}"
 INSTALL_MOD_BLOCK="${INSTALL_MOD_BLOCK}"
 EOF
@@ -1282,56 +1269,12 @@ phase_firewall_ufw() {
     ufw default deny incoming >> "$LOG_FILE" 2>&1
     ufw default allow outgoing >> "$LOG_FILE" 2>&1
     
-    # Permitir HTTP e HTTPS — modo Cloudflare-Only ou público
-    if [[ "$CLOUDFLARE_ONLY" =~ ^[Ss]$ ]]; then
-        log INFO "Modo Cloudflare-Only: liberando 80/443 APENAS para IPs da Cloudflare (IPv4 + IPv6)..."
-
-        # Cloudflare IPv4 ranges (fonte: https://www.cloudflare.com/ips/)
-        CF_IPV4_RANGES=(
-            "173.245.48.0/20"
-            "103.21.244.0/22"
-            "103.22.200.0/22"
-            "103.31.4.0/22"
-            "141.101.64.0/18"
-            "108.162.192.0/18"
-            "190.93.240.0/20"
-            "188.114.96.0/20"
-            "197.234.240.0/22"
-            "198.41.128.0/17"
-            "162.158.0.0/15"
-            "104.16.0.0/13"
-            "104.24.0.0/14"
-            "172.64.0.0/13"
-            "131.0.72.0/22"
-        )
-        for cf_ip in "${CF_IPV4_RANGES[@]}"; do
-            ufw allow from "$cf_ip" to any port 80 proto tcp comment 'Cloudflare IPv4' >> "$LOG_FILE" 2>&1
-            ufw allow from "$cf_ip" to any port 443 proto tcp comment 'Cloudflare IPv4' >> "$LOG_FILE" 2>&1
-        done
-
-        # Cloudflare IPv6 ranges
-        CF_IPV6_RANGES=(
-            "2400:cb00::/32"
-            "2606:4700::/32"
-            "2803:f800::/32"
-            "2405:b500::/32"
-            "2405:8100::/32"
-            "2a06:98c0::/29"
-            "2c0f:f248::/32"
-        )
-        for cf_ip in "${CF_IPV6_RANGES[@]}"; do
-            ufw allow from "$cf_ip" to any port 80 proto tcp comment 'Cloudflare IPv6' >> "$LOG_FILE" 2>&1
-            ufw allow from "$cf_ip" to any port 443 proto tcp comment 'Cloudflare IPv6' >> "$LOG_FILE" 2>&1
-        done
-
-        log SUCCESS "✅ HTTP/HTTPS liberados APENAS para IPs da Cloudflare (15 ranges IPv4 + 7 IPv6)"
-        log WARNING "  ⚠️  Certifique-se que todos os domínios têm o proxy da Cloudflare ativo"
-    else
-        log INFO "Liberando portas HTTP/HTTPS (acesso público)..."
-        ufw allow 80/tcp comment 'HTTP - public' >> "$LOG_FILE" 2>&1
-        ufw allow 443/tcp comment 'HTTPS - public' >> "$LOG_FILE" 2>&1
-        log SUCCESS "✅ Portas 80 (HTTP) e 443 (HTTPS) liberadas para acesso público"
-    fi
+    # Permitir HTTP e HTTPS publicamente (portas 80 e 443)
+    log INFO "Liberando portas HTTP/HTTPS (acesso público)..."
+    ufw allow 80/tcp comment 'HTTP - public' >> "$LOG_FILE" 2>&1
+    ufw allow 443/tcp comment 'HTTPS - public' >> "$LOG_FILE" 2>&1
+    log SUCCESS "✅ Portas 80 (HTTP) e 443 (HTTPS) liberadas"
+    log INFO    "  • Para restringir aos IPs da Cloudflare, execute: bash cloudflare-update-ufw.sh"
     
     # Permitir TUDO via Tailscale (VPN privada)
     log INFO "Liberando interface Tailscale (acesso total via VPN)..."
@@ -1345,24 +1288,15 @@ phase_firewall_ufw() {
     echo -e "${COLOR_BOLD}${COLOR_YELLOW}════════════════════════════════════════════════════════${COLOR_RESET}"
     echo ""
     echo "Regras configuradas:"
-    if [[ "$CLOUDFLARE_ONLY" =~ ^[Ss]$ ]]; then
-        echo "  ✅ HTTP: 80/tcp  (APENAS IPs Cloudflare — 15 ranges IPv4 + 7 IPv6)"
-        echo "  ✅ HTTPS: 443/tcp (APENAS IPs Cloudflare — 15 ranges IPv4 + 7 IPv6)"
-    else
-        echo "  ✅ HTTP: 80/tcp (PÚBLICO - sites/APIs)"
-        echo "  ✅ HTTPS: 443/tcp (PÚBLICO - sites/APIs)"
-    fi
+    echo "  ✅ HTTP: 80/tcp (PÚBLICO)"
+    echo "  ✅ HTTPS: 443/tcp (PÚBLICO)"
     echo "  ✅ SSH: porta $SSH_PORT (APENAS via Tailscale)"
     echo "  ✅ Todas outras portas: (APENAS via Tailscale)"
     echo "  ❌ Política padrão: DENY (bloqueia acesso público)"
     echo ""
     echo -e "${COLOR_RED}${COLOR_BOLD}IMPORTANTE:${COLOR_RESET}"
-    if [[ "$CLOUDFLARE_ONLY" =~ ^[Ss]$ ]]; then
-        echo "  • Acesso HTTP/HTTPS: APENAS via Cloudflare proxy"
-        echo "  • Ataques diretos ao IP em 80/443 serão DROP silencioso"
-    else
-        echo "  • Acesso público: APENAS HTTP (80) e HTTPS (443)"
-    fi
+    echo "  • Acesso público: APENAS HTTP (80) e HTTPS (443)"
+    echo "  • Para Cloudflare-Only execute: bash cloudflare-update-ufw.sh"
     echo "  • SSH, painéis, DBs, etc: APENAS via Tailscale VPN"
     echo "  • Conecte via: ssh $SSH_USER@$TAILSCALE_IPV4 -p $SSH_PORT"
     echo "  • Para acessar outras portas, conecte primeiro ao Tailscale"
@@ -1642,13 +1576,9 @@ show_summary() {
     echo "    • Status: Conectado"
     echo ""
     echo "  🛡️  Firewall UFW:"
-    if [[ "$CLOUDFLARE_ONLY" =~ ^[Ss]$ ]]; then
-        echo "    • HTTP (80):  APENAS Cloudflare IPs (15 IPv4 + 7 IPv6 ranges)"
-        echo "    • HTTPS (443): APENAS Cloudflare IPs (15 IPv4 + 7 IPv6 ranges)"
-    else
-        echo "    • HTTP (80): PÚBLICO"
-        echo "    • HTTPS (443): PÚBLICO"
-    fi
+    echo "    • HTTP (80): PÚBLICO"
+    echo "    • HTTPS (443): PÚBLICO"
+    echo "    • Cloudflare-Only: execute bash cloudflare-update-ufw.sh"
     echo "    • SSH ($SSH_PORT): APENAS VIA TAILSCALE"
     echo "    • Outras portas: APENAS VIA TAILSCALE"
     echo "    • IPv6: HABILITADO"
@@ -1668,21 +1598,10 @@ show_summary() {
     echo "    ssh $SSH_USER@$TAILSCALE_IPV4 -p $SSH_PORT"
     echo ""
     echo "  🌐 Acesso Web:"
-    if [[ "$CLOUDFLARE_ONLY" =~ ^[Ss]$ ]]; then
-        echo "    • HTTP/HTTPS: via Cloudflare proxy APENAS"
-        echo "    • Acesso direto ao IP bloqueado (Cloudflare-Only ativo)"
-    else
-        echo "    • HTTP: http://SEU_IP_PUBLICO"
-        echo "    • HTTPS: https://SEU_IP_PUBLICO"
-    fi
+    echo "    • HTTP: http://SEU_IP_PUBLICO"
+    echo "    • HTTPS: https://SEU_IP_PUBLICO"
+    echo "    • Para Cloudflare-Only: bash cloudflare-update-ufw.sh"
     echo ""
-    if [[ "$CLOUDFLARE_ONLY" =~ ^[Ss]$ ]]; then
-        echo "  🔄 Cloudflare IP Updater:"
-        echo "    • Timer: semanal (toda segunda-feira ±1h)"
-        echo "    • Log:   /var/log/cf-update-ufw.log"
-        echo "    • Manual: systemctl start cf-update-ufw.service"
-        echo ""
-    fi
     echo "  📝 Logs deste script:"
     echo "    • Log completo: $LOG_FILE"
     echo "    • Log de erros: $ERROR_LOG"
@@ -1706,9 +1625,9 @@ Tailscale VPN:
   Interface: tailscale0
 
 Firewall UFW:
-  • HTTP/HTTPS (80/443): $([ "$CLOUDFLARE_ONLY" = "S" ] && echo "APENAS IPs Cloudflare" || echo "PÚBLICO")
+  • HTTP/HTTPS (80/443): PÚBLICO
   • Outras portas: APENAS via Tailscale
-  • Cloudflare IP Updater: $([ "$CLOUDFLARE_ONLY" = "S" ] && echo "Ativo (semanal) — /var/log/cf-update-ufw.log" || echo "Desativado")
+  • Cloudflare-Only: execute bash cloudflare-update-ufw.sh para restringir
 
 Sistema:
   • Timezone: America/Sao_Paulo
