@@ -405,7 +405,8 @@ check_crowdsec() {
     # Bouncer iptables
     if systemctl is-active --quiet crowdsec-firewall-bouncer 2>/dev/null; then
         local blocked
-        blocked=$(cscli decisions list 2>/dev/null | grep -c "ban" || echo 0)
+        blocked=$(cscli decisions list 2>/dev/null | grep -c "ban" 2>/dev/null)
+        blocked=${blocked:-0}
         log_result PASS "Bouncer iptables ativo" "(${blocked} IPs bloqueados)"
     else
         log_result FAIL "Bouncer iptables ativo" "(serviço parado — IPs não estão sendo bloqueados)"
