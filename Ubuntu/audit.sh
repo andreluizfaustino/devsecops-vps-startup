@@ -350,22 +350,14 @@ check_firewall() {
         log_result FAIL "Interface Tailscale liberada no UFW" "(SSH ficará inacessível)"
     fi
 
-    # Cloudflare IP Updater
-    if systemctl is-enabled --quiet cf-update-ufw.timer 2>/dev/null; then
-        local next_run
-        next_run=$(systemctl status cf-update-ufw.timer 2>/dev/null | grep "Trigger:" | awk '{print $2, $3}')
-        log_result PASS "Cloudflare IP Updater timer ativo" "(próximo: ${next_run:-desconhecido})"
-
-        # Contar regras Cloudflare
-        local cf_rules
-        cf_rules=$(ufw status 2>/dev/null | grep -c "Cloudflare" || echo 0)
-        if [ "${cf_rules:-0}" -gt 0 ]; then
-            log_result PASS "Regras Cloudflare no UFW" "(${cf_rules} regras ativas)"
-        else
-            log_result WARN "Regras Cloudflare no UFW" "(nenhuma regra — execute: systemctl start cf-update-ufw.service)"
-        fi
+    # Regras Cloudflare no UFW
+    local cf_rules
+    cf_rules=$(ufw status 2>/dev/null | grep -c "Cloudflare" || echo 0)
+    if [ "${cf_rules:-0}" -gt 0 ]; then
+        log_result PASS "Regras Cloudflare no UFW" "(${cf_rules} regras ativas)"
+        log_result PASS "Cloudflare IP Updater" "(execute cloudflare-update-ufw.sh para sincronizar)"
     else
-        log_result WARN "Cloudflare IP Updater" "(não configurado — opcional se CF-Only desativado)"
+        log_result WARN "Regras Cloudflare no UFW" "(nenhuma regra — modo CF-Only não ativo ou execute cloudflare-update-ufw.sh)"
     fi
 }
 
