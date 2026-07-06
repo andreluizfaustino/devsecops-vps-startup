@@ -45,8 +45,8 @@ COLOR_BLUE='\033[0;34m'
 COLOR_CYAN='\033[0;36m'
 COLOR_BOLD='\033[1m'
 
-# Total de fases (17 fases)
-TOTAL_PHASES=17
+# Total de fases (16 fases)
+TOTAL_PHASES=16
 
 # Tempo inicial do script
 START_TIME=$(date +%s)
@@ -1440,6 +1440,9 @@ phase_crowdsec() {
 
     log INFO "Instalando CrowdSec via script oficial..."
     curl -s https://install.crowdsec.net | sh >> "$LOG_FILE" 2>&1
+
+    log INFO "Instalando pacote crowdsec..."
+    apt install -y -qq crowdsec >> "$LOG_FILE" 2>&1
 
     log INFO "Instalando bouncer iptables (bloqueia IPs maliciosos em tempo real)..."
     apt install -y -qq crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1
