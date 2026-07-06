@@ -1454,6 +1454,20 @@ phase_crowdsec() {
 
     systemctl enable crowdsec                         2>&1 | tee -a "$LOG_FILE"
     systemctl restart crowdsec                        2>&1 | tee -a "$LOG_FILE"
+
+    # Registrar bouncer e injetar API key antes de iniciar
+    log INFO "Registrando bouncer iptables no CrowdSec..."
+    sleep 3  # aguardar CrowdSec LAPI estar pronto
+    local bouncer_key
+    bouncer_key=$(cscli bouncers add firewall-bouncer -o raw 2>/dev/null || true)
+    if [ -n "$bouncer_key" ] && [ -f /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml ]; then
+        sed -i "s/^api_key:.*/api_key: ${bouncer_key}/" /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
+        log SUCCESS "API key do bouncer registrada"
+    else
+        log WARNING "Não foi possível registrar bouncer automaticamente — execute manualmente:"
+        log WARNING "  cscli bouncers add firewall-bouncer && systemctl restart crowdsec-firewall-bouncer"
+    fi
+
     systemctl enable crowdsec-firewall-bouncer        2>&1 | tee -a "$LOG_FILE"
     systemctl restart crowdsec-firewall-bouncer       2>&1 | tee -a "$LOG_FILE"
 
