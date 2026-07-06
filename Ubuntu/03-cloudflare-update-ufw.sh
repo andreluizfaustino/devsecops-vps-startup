@@ -183,6 +183,26 @@ if [[ ! "$confirm" =~ ^[Ss]$ ]]; then
 fi
 
 # ════════════════════════════════════════════════════════
+# REMOVER REGRAS PÚBLICAS (Anywhere) para 80 e 443
+# Garante que somente IPs Cloudflare possam acessar HTTP/HTTPS
+# ════════════════════════════════════════════════════════
+
+echo -e "${COLOR_CYAN}ℹ Removendo regras públicas (Anywhere) para 80 e 443...${COLOR_RESET}"
+
+# Remover em loop até não existir mais (UFW reindexas após cada delete)
+for port in 80 443; do
+    while ufw status numbered 2>/dev/null | grep -qE "^\[ *[0-9]+\] +${port}/tcp +ALLOW IN +Anywhere *$"; do
+        num=$(ufw status numbered 2>/dev/null \
+            | grep -E "^\[ *[0-9]+\] +${port}/tcp +ALLOW IN +Anywhere *$" \
+            | awk -F'[][]' '{print $2}' | head -1)
+        [ -z "$num" ] && break
+        ufw --force delete "$num" > /dev/null 2>&1 && \
+            echo -e "  ${COLOR_RED}− Removida regra pública: ${port}/tcp ALLOW Anywhere${COLOR_RESET}" || break
+    done
+done
+echo ""
+
+# ════════════════════════════════════════════════════════
 # REMOVER IPS OBSOLETOS
 # ════════════════════════════════════════════════════════
 
