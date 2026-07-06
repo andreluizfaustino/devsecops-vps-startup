@@ -1,4 +1,81 @@
-# 🛡️ VPS Startup Hardening Script
+# 🛡️ VPS Hardening Scripts
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04%20%7C%2024.04-orange?logo=ubuntu)](https://ubuntu.com/)
+[![Bash](https://img.shields.io/badge/Bash-5.0+-green?logo=gnu-bash)](https://www.gnu.org/software/bash/)
+[![Tailscale](https://img.shields.io/badge/Tailscale-VPN-blue?logo=tailscale)](https://tailscale.com/)
+[![Cloudflare](https://img.shields.io/badge/Cloudflare-Ready-orange?logo=cloudflare)](https://cloudflare.com/)
+
+Conjunto de scripts para hardening, monitoramento e manutenção de servidores Ubuntu em produção.
+
+> 📖 **Documentação técnica completa:** [DOCS.md](DOCS.md)
+
+---
+
+## Scripts
+
+| Script | Quando rodar | O que faz |
+|---|---|---|
+| `01-startup.sh` | Uma vez, ao provisionar a VPS | Hardening completo: SSH, firewall, kernel, Tailscale, Fail2Ban, CrowdSec, Auditd |
+| `02-docker-and-netdata.sh` | Após o reboot do 01 | Instala Docker + Netdata com integrações CrowdSec e Fail2Ban |
+| `03-cloudflare-update-ufw.sh` | Após o 01, e quando quiser atualizar | Restringe 80/443 aos IPs oficiais da Cloudflare |
+| `_audit.sh` | A qualquer momento | Valida todas as configurações e gera score de saúde |
+
+---
+
+## Uso Rápido
+
+```bash
+# 1. Clonar o repositório na VPS
+git clone https://github.com/andreluizfaustino/devsecops-vps-startup.git
+cd devsecops-vps-startup/Ubuntu
+
+# 2. Hardening principal (reboot automático ao final)
+bash 01-startup.sh
+
+# 3. Reconectar via Tailscale e instalar Docker + Netdata
+bash 02-docker-and-netdata.sh
+
+# 4. Ativar modo Cloudflare-Only
+bash 03-cloudflare-update-ufw.sh
+
+# 5. Validar tudo
+bash _audit.sh
+```
+
+**Score esperado após todos os scripts:** ~97% — 0 FAILs
+
+---
+
+## Arquitetura de Segurança
+
+```
+Internet → Cloudflare WAF → UFW (só IPs Cloudflare) → CrowdSec → Aplicação
+Admin    → Tailscale VPN → SSH (só IP Tailscale)
+```
+
+---
+
+## Pré-requisitos
+
+- Ubuntu 22.04 LTS ou 24.04 LTS
+- Acesso root
+- Conta no [Tailscale](https://tailscale.com) (gratuita)
+- Par de chaves SSH (`ssh-keygen -t ed25519`)
+
+---
+
+## Documentação
+
+Para detalhes completos de cada fase, parâmetro e decisão técnica, consulte [DOCS.md](DOCS.md).
+
+---
+
+## Licença
+
+MIT — veja [LICENSE](../LICENSE) para detalhes.
+
+**Autor:** André Luiz Faustino · [@andreluizfaustino](https://github.com/andreluizfaustino)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04%20%7C%2024.04-orange?logo=ubuntu)](https://ubuntu.com/)
