@@ -16,9 +16,10 @@ Conjunto de scripts para hardening, monitoramento e manutenção de servidores U
 
 | Script | Quando rodar | O que faz |
 |---|---|---|
-| `01-startup.sh` | Uma vez, ao provisionar a VPS | Hardening completo: SSH, firewall, kernel, Tailscale, Fail2Ban, CrowdSec, Auditd |
-| `02-docker-and-netdata.sh` | Após o reboot do 01 | Instala Docker + Netdata com integrações CrowdSec e Fail2Ban |
+| `01-startup.sh` | Uma vez, ao provisionar a VPS | Hardening: SSH, firewall, kernel, Tailscale, Fail2Ban, Auditd |
+| `02-docker-and-netdata.sh` | Após o reboot do 01 | Instala Docker + Netdata com integrações Fail2Ban e métricas |
 | `03-cloudflare-update-ufw.sh` | Após o 01, e quando quiser atualizar | Restringe 80/443 aos IPs oficiais da Cloudflare |
+| `04-traefik-and-portainer.sh` | Após o 02 e 03 | Instala Traefik v3 + Portainer CE com Let's Encrypt automático |
 | `_audit.sh` | A qualquer momento | Valida todas as configurações e gera score de saúde |
 
 ---
@@ -39,19 +40,22 @@ bash 02-docker-and-netdata.sh
 # 4. Ativar modo Cloudflare-Only
 bash 03-cloudflare-update-ufw.sh
 
-# 5. Validar tudo
+# 5. Instalar Traefik + Portainer
+bash 04-traefik-and-portainer.sh
+
+# 6. Validar tudo
 bash _audit.sh
 ```
 
-**Score esperado após todos os scripts:** ~97% — 0 FAILs
+**Score esperado após 01+02+03:** ~97% — 0 FAILs
 
 ---
 
 ## Arquitetura de Segurança
 
 ```
-Internet → Cloudflare WAF → UFW (só IPs Cloudflare) → CrowdSec → Aplicação
-Admin    → Tailscale VPN → SSH (só IP Tailscale)
+Internet → Cloudflare WAF → UFW (só IPs Cloudflare) → Traefik → Aplicação
+Admin    → Tailscale VPN  → SSH (só IP Tailscale)
 ```
 
 ---

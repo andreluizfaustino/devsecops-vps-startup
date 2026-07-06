@@ -11,6 +11,7 @@
 - [01-startup.sh — Hardening do Servidor](#01-startupsh--hardening-do-servidor)
 - [02-docker-and-netdata.sh — Docker e Monitoramento](#02-docker-and-netdatash--docker-e-monitoramento)
 - [03-cloudflare-update-ufw.sh — Cloudflare IP Updater](#03-cloudflare-update-ufwsh--cloudflare-ip-updater)
+- [04-traefik-and-portainer.sh — Traefik + Portainer](#04-traefik-and-portainersh--traefik--portainer)
 - [\_audit.sh — Auditoria de Saúde](#_auditsh--auditoria-de-saúde)
 - [Arquivos Gerados](#arquivos-gerados)
 - [Fluxo de Execução Recomendado](#fluxo-de-execução-recomendado)
@@ -30,7 +31,7 @@ Internet
             └── tudo → ALLOW ✅ (admin e dispositivos autorizados)
 
 Camadas de proteção (de fora para dentro):
-  Cloudflare WAF → UFW Firewall → CrowdSec (IPS) → Fail2Ban (SSH) → Aplicação
+  Cloudflare WAF → UFW Firewall → Traefik (reverse proxy) → Fail2Ban (SSH) → Aplicação
 ```
 
 ---
@@ -39,7 +40,7 @@ Camadas de proteção (de fora para dentro):
 
 ### Visão Geral
 
-Script principal que aplica **16 fases de hardening** em um servidor Ubuntu recém-criado. Transforma uma VPS padrão em um servidor seguro para produção em ~4 minutos.
+Script principal que aplica **15 fases de hardening** em um servidor Ubuntu recém-criado. Transforma uma VPS padrão em um servidor seguro para produção em ~4 minutos.
 
 ```bash
 sudo bash 01-startup.sh
@@ -105,7 +106,6 @@ Cole o conteúdo do `~/.ssh/id_ed25519.pub`. Validação: deve começar com `ssh
 | [1] | Unattended Upgrades | S | ~2 min |
 | [2] | Auditd | S | ~2 min |
 | [4] | Logging Avançado | S | ~5s |
-| [6] | CrowdSec | S | ~3 min |
 | [7] | Bloqueio de Módulos de Kernel | S | ~5s |
 
 ---
@@ -366,37 +366,7 @@ Escopo: `/var/log/auth.log` (tentativas de login SSH)
 
 ---
 
-#### FASE 13 — CrowdSec *(opcional)*
-**Checkpoint:** `crowdsec`
-
-- Adiciona repositório oficial via `install.crowdsec.net`
-- `apt install crowdsec` — motor principal
-- `apt install crowdsec-firewall-bouncer-iptables` — bouncer que bloqueia IPs no firewall
-
-**Registro da API key (crítico):**
-```bash
-bouncer_key=$(cscli bouncers add firewall-bouncer -o raw)
-sed -i "s/^api_key:.*/api_key: ${bouncer_key}/" \
-    /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
-```
-
-**Collections instaladas:**
-- `crowdsecurity/linux` — regras gerais para servidores Linux
-- `crowdsecurity/traefik` — proteção para tráfego Traefik
-- `crowdsecurity/nginx` — proteção para tráfego Nginx
-
-**Comparação com Fail2Ban:**
-
-| | Fail2Ban | CrowdSec |
-|---|---|---|
-| Escopo | SSH brute force (auth.log) | HTTP, bots, scanners, IPs de reputação ruim |
-| Inteligência | Local | Colaborativa (milhares de servidores) |
-| Bloqueio | Fail2Ban chain | iptables/nftables via bouncer |
-| Conflito | Nenhum — escopos distintos | Nenhum |
-
----
-
-#### FASE 14 — Bloqueio de Módulos de Kernel *(opcional)*
+#### FASE 13 — Bloqueio de Módulos de Kernel *(opcional)*
 **Checkpoint:** `kernel_modules`
 
 Cria `/etc/modprobe.d/blacklist-hardening.conf`:
@@ -423,7 +393,7 @@ Cria `/etc/modprobe.d/blacklist-hardening.conf`:
 
 ---
 
-#### FASE 15 — Auditd *(opcional)*
+#### FASE 14 — Auditd *(opcional)*
 **Checkpoint:** `auditd`
 
 Configura `/etc/audit/rules.d/hardening.rules` com **5 regras otimizadas** (~1% overhead):
@@ -450,7 +420,7 @@ Logs em `/var/log/audit/audit.log`.
 
 ---
 
-#### FASE 16 — Logging Avançado *(opcional)*
+#### FASE 15 — Logging Avançado *(opcional)*
 **Checkpoint:** `logging`
 
 **Logrotate** — `/etc/logrotate.d/sudo`:
@@ -647,6 +617,113 @@ IPs na lista atual da Cloudflare:   46
 
 ---
 
+## 04-traefik-and-portainer.sh — Traefik + Portainer
+
+### Visão Geral
+
+Instala **Traefik v3** como reverse proxy com SSL automático via Let's Encrypt e **Portainer CE** para gerenciamento visual de containers Docker. Deve ser executado após `02-docker-and-netdata.sh` e `03-cloudflare-update-ufw.sh`.
+
+```bash
+sudo bash 04-traefik-and-portainer.sh
+```
+
+---
+
+### Configuração Interativa
+
+Solicita apenas o **email para o Let's Encrypt** (usado para notificações de expiração).
+
+---
+
+### Etapa 1 — Rede Docker Compartilhada
+
+Cria a rede Docker `traefik_public`. Todos os serviços que precisam ser expostos via Traefik devem usar esta rede.
+
+```bash
+docker network create traefik_public
+```
+
+Se a rede já existir, pula sem erro.
+
+---
+
+### Etapa 2 — Traefik v3
+
+**Diretório:** `/opt/traefik/`
+
+**`traefik.yml` — configuração estática:**
+
+| Componente | Configuração |
+|---|---|
+| Entry point `web` (80) | Redireciona tudo para HTTPS (301 permanente) |
+| Entry point `websecure` (443) | TLS + forwardedHeaders com IPs Cloudflare como trusted proxies |
+| Let's Encrypt | HTTP-01 challenge via Cloudflare proxy, email configurado interativamente |
+| Docker provider | `exposedByDefault: false` — só containers com `traefik.enable=true` são expostos |
+| File provider | Lê configs dinâmicas de `/opt/traefik/dynamic/` |
+| Dashboard | Porta 8080, `insecure: true` (seguro via UFW — só Tailscale acessa) |
+| Logs | Access log com IP real do visitante (`CF-Connecting-IP`, `X-Forwarded-For`) |
+
+**Cloudflare Real IP (crítico):**
+Todos os 15 ranges IPv4 e 7 ranges IPv6 da Cloudflare são configurados como `trustedIPs` no entry point 443. Traefik extrai o IP real do visitante dos headers `CF-Connecting-IP` / `X-Forwarded-For` e o usa nos logs e middlewares.
+
+**`acme.json`** — armazena certificados Let's Encrypt. Criado com `chmod 600` obrigatório.
+
+**Como Let's Encrypt HTTP-01 funciona com Cloudflare proxy ativo:**
+```
+LE → http://dominio.com/.well-known/acme-challenge/TOKEN
+   → Cloudflare recebe (não redireciona esse path para HTTPS)
+   → Cloudflare encaminha para VPS porta 80 (de um IP Cloudflare)
+   → UFW permite (IP Cloudflare)
+   → Traefik responde com o token
+   → LE valida e emite o certificado
+```
+
+**Acesso:** `http://<IP_TAILSCALE>:8080/dashboard/`
+
+---
+
+### Etapa 3 — Portainer CE
+
+**Diretório:** `/opt/portainer/`
+
+- Porta 9000 — UI web (HTTP)
+- Porta 9443 — UI web (HTTPS)
+- Volume `portainer_data` — dados persistentes
+- **Não** passa pelo Traefik — acesso direto via porta
+- UFW bloqueia acesso externo — acessível apenas via Tailscale
+
+**Acesso:** `http://<IP_TAILSCALE>:9000`
+
+---
+
+### Como expor serviços via Traefik
+
+Cada serviço gerenciado pelo Portainer configura seu próprio roteamento via **labels Docker**:
+
+```yaml
+services:
+  minha-app:
+    image: minha-imagem
+    networks:
+      - traefik_public          # obrigatório — conectar na rede do Traefik
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.minha-app.rule=Host(`app.meudominio.com`)"
+      - "traefik.http.routers.minha-app.tls=true"
+      - "traefik.http.routers.minha-app.tls.certresolver=letsencrypt"
+      - "traefik.http.services.minha-app.loadbalancer.server.port=3000"
+
+networks:
+  traefik_public:
+    external: true              # rede criada pelo 04-traefik-and-portainer.sh
+```
+
+Traefik detecta automaticamente o container, gera o certificado Let's Encrypt para `app.meudominio.com` e começa a rotear.
+
+**Requisito no Cloudflare:** domínio deve ter o proxy ativo (nuvem laranja).
+
+---
+
 ## _audit.sh — Auditoria de Saúde
 
 ### Visão Geral
@@ -736,7 +813,7 @@ Score: 97% — Excelente
    cd devsecops-vps-startup/Ubuntu
 
 4. bash 01-startup.sh
-   → Configurar interativamente
+   → Configurar interativamente (usuário, porta, swap, chave SSH, opcionais)
    → Autenticar Tailscale no navegador
    → Aguardar reboot automático (~4 min)
 
@@ -745,18 +822,25 @@ Score: 97% — Excelente
 
 6. bash 02-docker-and-netdata.sh
    → Instala Docker
-   → Sobe Netdata com integrações
+   → Sobe Netdata com integrações Fail2Ban e métricas
    → Acesso: http://<IP_TAILSCALE>:19999
 
 7. bash 03-cloudflare-update-ufw.sh
-   → Ativa modo Cloudflare-Only
+   → Ativa modo Cloudflare-Only (80/443 só para IPs Cloudflare)
    → Confirmar com 's'
 
-8. bash _audit.sh
+8. bash 04-traefik-and-portainer.sh
+   → Informa email para Let's Encrypt
+   → Instala Traefik v3 com SSL automático
+   → Instala Portainer CE
+   → Traefik:  http://<IP_TAILSCALE>:8080/dashboard/
+   → Portainer: http://<IP_TAILSCALE>:9000
+
+9. bash _audit.sh
    → Validar score (esperado: ~97%)
 
-9. Manutenção futura:
-   - Atualizar IPs Cloudflare: bash 03-cloudflare-update-ufw.sh
-   - Health check: bash _audit.sh
-   - Nova VPS: git pull && repetir passos 4-8
+10. Manutenção futura:
+    - Atualizar IPs Cloudflare: bash 03-cloudflare-update-ufw.sh
+    - Health check: bash _audit.sh
+    - Nova VPS: git pull && repetir passos 4-9
 ```
