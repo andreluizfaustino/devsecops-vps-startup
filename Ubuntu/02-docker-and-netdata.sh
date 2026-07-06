@@ -198,7 +198,39 @@ EOF
 fi
 
 # ════════════════════════════════════════════════════════
-# RESUMO FINAL
+# ETAPA 4: INTEGRAÇÃO UFW/IPTABLES
+# ════════════════════════════════════════════════════════
+
+log_phase "Etapa 4/4: Integração UFW/iptables"
+
+# Netdata coleta iptables via go.d — mostra pacotes bloqueados por chain/rule em tempo real
+# Útil para ver volume de ataques sendo dropados pelo UFW
+cat > "${NETDATA_CONFIG_DIR}/go.d/iptables.conf" << 'IPTABLES_CONF'
+jobs:
+  - name: filter
+    tables:
+      - name: filter
+        chains:
+          - INPUT
+          - FORWARD
+          - OUTPUT
+IPTABLES_CONF
+
+log_success "Config iptables/UFW criada — Netdata monitorará pacotes por chain"
+log_info    "  • INPUT:   tráfego entrante (inclui DROPs do UFW)"
+log_info    "  • FORWARD: tráfego roteado (Docker)"
+log_info    "  • OUTPUT:  tráfego sainte"
+
+# Reiniciar Netdata para aplicar
+log_info "Reiniciando Netdata para aplicar config iptables..."
+docker restart netdata > /dev/null 2>&1
+sleep 5
+
+if docker ps 2>/dev/null | grep -q "netdata"; then
+    log_success "Netdata reiniciado com monitoramento iptables/UFW ativo"
+else
+    log_warn "Netdata não respondeu após reinício — verifique manualmente"
+fi
 # ════════════════════════════════════════════════════════
 
 # Detectar IP do Tailscale para exibir URL de acesso
@@ -217,6 +249,7 @@ echo -e "    ${COLOR_GREEN}✅${COLOR_RESET} Host: CPU, RAM, disco, rede, proces
 echo -e "    ${COLOR_GREEN}✅${COLOR_RESET} Docker: métricas de todos os containers"
 echo -e "    ${COLOR_GREEN}✅${COLOR_RESET} Traefik: requests, latência, status codes (automático)"
 echo -e "    ${COLOR_GREEN}✅${COLOR_RESET} Fail2Ban: bans ativos e jails (automático)"
+echo -e "    ${COLOR_GREEN}✅${COLOR_RESET} UFW/iptables: pacotes bloqueados por chain em tempo real"
 if command -v cscli &>/dev/null && [ -f "${NETDATA_CONFIG_DIR}/go.d/crowdsec.conf" ]; then
     echo -e "    ${COLOR_GREEN}✅${COLOR_RESET} CrowdSec: alertas, decisões e métricas (configurado)"
 else
