@@ -46,8 +46,8 @@ COLOR_BLUE='\033[0;34m'
 COLOR_CYAN='\033[0;36m'
 COLOR_BOLD='\033[1m'
 
-# Total de fases (19 fases)
-TOTAL_PHASES=18
+# Total de fases (17 fases)
+TOTAL_PHASES=17
 
 # Tempo inicial do script
 START_TIME=$(date +%s)
@@ -1595,129 +1595,6 @@ MOD_CONF
 }
 
 # ════════════════════════════════════════════════════════
-# FASE: CLOUDFLARE IP UPDATER
-# ════════════════════════════════════════════════════════
-
-phase_cloudflare_updater() {
-    local PHASE="cloudflare_updater"
-    if is_phase_completed "$PHASE"; then
-        log INFO "Fase '$PHASE' já concluída. Pulando..."
-        return 0
-    fi
-
-    log PHASE "Configurando serviço de atualização semanal de IPs da Cloudflare"
-    local phase_start=$(date +%s)
-
-    # Script de atualização
-    cat > /usr/local/bin/cf-update-ufw.sh << 'CF_SCRIPT'
-#!/bin/bash
-# Atualiza regras UFW com os IPs atuais da Cloudflare
-# Executado semanalmente via systemd timer
-# Fonte: https://www.cloudflare.com/ips-v4 e https://www.cloudflare.com/ips-v6
-
-set -euo pipefail
-
-LOG="/var/log/cf-update-ufw.log"
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Iniciando atualização de IPs da Cloudflare..." >> "$LOG"
-
-# Buscar IPs atuais da Cloudflare
-CF_IPV4=$(curl -s --max-time 30 https://www.cloudflare.com/ips-v4 2>/dev/null | grep -E '^[0-9]')
-CF_IPV6=$(curl -s --max-time 30 https://www.cloudflare.com/ips-v6 2>/dev/null | grep -E '^[0-9a-f2]')
-
-if [ -z "$CF_IPV4" ] || [ -z "$CF_IPV6" ]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERRO: falha ao buscar IPs da Cloudflare. Regras mantidas." >> "$LOG"
-    exit 1
-fi
-
-# Remover regras antigas da Cloudflare (por número, de trás para frente para não deslocar índices)
-ufw status numbered 2>/dev/null \
-    | grep -E 'Cloudflare' \
-    | awk -F'[][]' '{print $2}' \
-    | sort -rn \
-    | while read -r num; do
-        ufw --force delete "$num" >> "$LOG" 2>&1 || true
-    done
-
-# Adicionar regras IPv4
-while IFS= read -r ip; do
-    [ -z "$ip" ] && continue
-    ufw allow from "$ip" to any port 80  proto tcp comment 'Cloudflare IPv4' >> "$LOG" 2>&1
-    ufw allow from "$ip" to any port 443 proto tcp comment 'Cloudflare IPv4' >> "$LOG" 2>&1
-done <<< "$CF_IPV4"
-
-# Adicionar regras IPv6
-while IFS= read -r ip; do
-    [ -z "$ip" ] && continue
-    ufw allow from "$ip" to any port 80  proto tcp comment 'Cloudflare IPv6' >> "$LOG" 2>&1
-    ufw allow from "$ip" to any port 443 proto tcp comment 'Cloudflare IPv6' >> "$LOG" 2>&1
-done <<< "$CF_IPV6"
-
-IPV4_COUNT=$(echo "$CF_IPV4" | wc -l)
-IPV6_COUNT=$(echo "$CF_IPV6" | wc -l)
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Concluído: ${IPV4_COUNT} ranges IPv4, ${IPV6_COUNT} ranges IPv6." >> "$LOG"
-CF_SCRIPT
-
-    chmod +x /usr/local/bin/cf-update-ufw.sh
-
-    # Systemd service (execução única)
-    cat > /etc/systemd/system/cf-update-ufw.service << 'CF_SERVICE'
-[Unit]
-Description=Atualizar regras UFW com IPs da Cloudflare
-After=network-online.target ufw.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/cf-update-ufw.sh
-StandardOutput=journal
-StandardError=journal
-CF_SERVICE
-
-    # Systemd timer (semanal)
-    cat > /etc/systemd/system/cf-update-ufw.timer << 'CF_TIMER'
-[Unit]
-Description=Atualização semanal dos IPs da Cloudflare no UFW
-
-[Timer]
-OnCalendar=weekly
-Persistent=true
-RandomizedDelaySec=3600
-
-[Install]
-WantedBy=timers.target
-CF_TIMER
-
-    systemctl daemon-reload                  2>&1 | tee -a "$LOG_FILE"
-    systemctl enable cf-update-ufw.timer     2>&1 | tee -a "$LOG_FILE"
-    systemctl start  cf-update-ufw.timer     2>&1 | tee -a "$LOG_FILE"
-
-    # Executar imediatamente para validar
-    log INFO "Executando primeira atualização de IPs..."
-    if systemctl start cf-update-ufw.service 2>&1 | tee -a "$LOG_FILE"; then
-        log SUCCESS "IPs da Cloudflare atualizados com sucesso"
-        if [ -f /var/log/cf-update-ufw.log ]; then
-            tail -3 /var/log/cf-update-ufw.log | tee -a "$LOG_FILE"
-        fi
-    else
-        log WARNING "Primeira execução com erro — verifique: journalctl -u cf-update-ufw.service"
-        log WARNING "O timer tentará novamente na próxima semana automaticamente"
-    fi
-
-    log SUCCESS "Serviço configurado:"
-    log SUCCESS "  • Script:  /usr/local/bin/cf-update-ufw.sh"
-    log SUCCESS "  • Timer:   semanal (toda segunda-feira à meia-noite ±1h)"
-    log SUCCESS "  • Log:     /var/log/cf-update-ufw.log"
-    log INFO    "  • Execução manual: systemctl start cf-update-ufw.service"
-    log INFO    "  • Próxima execução: systemctl status cf-update-ufw.timer"
-
-    local phase_end=$(date +%s)
-    local phase_duration=$((phase_end - phase_start))
-    log SUCCESS "Fase concluída em $(format_time $phase_duration) | Tempo total: $(get_elapsed_time)"
-
-    mark_phase_completed "$PHASE"
-    show_progress
-}
-
 # ════════════════════════════════════════════════════════
 # RESUMO FINAL
 # ════════════════════════════════════════════════════════
@@ -1931,13 +1808,6 @@ main() {
     phase_ssh_config # Fase 10: Configurar SSH para escutar apenas no Tailscale
     phase_fail2ban
     phase_firewall_ufw # Fase 12: UFW - 80/443 (Cloudflare-only ou público) + resto via Tailscale
-
-    if [[ "$CLOUDFLARE_ONLY" =~ ^[Ss]$ ]]; then
-        phase_cloudflare_updater
-    else
-        log INFO "⏭️  Pulando serviço de atualização Cloudflare (Cloudflare-Only desativado)"
-        mark_phase_completed "cloudflare_updater"
-    fi
 
     if [[ "$INSTALL_CROWDSEC" =~ ^[Ss]$ ]]; then
         phase_crowdsec
