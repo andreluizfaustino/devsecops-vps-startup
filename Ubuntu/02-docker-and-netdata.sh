@@ -6,7 +6,6 @@
 # Repository: https://github.com/andreluizfaustino/devsecops-vps-startup
 #
 # Instala Docker (se necessário) e sobe o Netdata via Docker Compose.
-# Configura integração automática com CrowdSec (se instalado).
 #
 # Uso: sudo bash netdata-setup.sh
 # ════════════════════════════════════════════════════════
@@ -131,7 +130,7 @@ log_info "Criando diretórios em ${NETDATA_DIR}..."
 mkdir -p "${NETDATA_CONFIG_DIR}/go.d"
 
 # Docker Compose — Netdata cobre host + Docker + Traefik em 1 container
-# Usa bind mount para /etc/netdata para permitir injetar configs (ex: CrowdSec)
+    # Usa bind mount para /etc/netdata para permitir injetar configs
 cat > "${NETDATA_DIR}/docker-compose.yml" << 'NETDATA_COMPOSE'
 services:
   netdata:
@@ -180,58 +179,10 @@ else
 fi
 
 # ════════════════════════════════════════════════════════
-# ETAPA 3: INTEGRAÇÃO CROWDSEC (opcional)
+# ETAPA 3: INTEGRAÇÃO UFW/IPTABLES
 # ════════════════════════════════════════════════════════
 
-log_phase "Etapa 3/3: Integração CrowdSec"
-
-if ! command -v cscli &>/dev/null; then
-    log_warn "CrowdSec não instalado — pulando integração"
-    log_info "  Para ativar depois: rode este script novamente após instalar o CrowdSec"
-else
-    log_info "CrowdSec encontrado — configurando integração..."
-
-    # Gerar API key para o Netdata
-    # Remove bouncer antigo se existir (evita conflito)
-    cscli bouncers delete netdata-bouncer 2>/dev/null || true
-
-    NETDATA_API_KEY=$(cscli bouncers add netdata-bouncer -o raw 2>/dev/null || true)
-
-    if [ -z "$NETDATA_API_KEY" ]; then
-        log_warn "Não foi possível gerar API key do CrowdSec para Netdata"
-        log_info "  Execute manualmente: cscli bouncers add netdata-bouncer"
-    else
-        log_success "API key gerada para Netdata: ${NETDATA_API_KEY:0:8}..."
-
-        # Criar config do collector CrowdSec no Netdata
-        cat > "${NETDATA_CONFIG_DIR}/go.d/crowdsec.conf" << EOF
-jobs:
-  - name: local
-    url: http://localhost:8080
-    credentials:
-      api_key: ${NETDATA_API_KEY}
-EOF
-
-        log_success "Config CrowdSec criada em ${NETDATA_CONFIG_DIR}/go.d/crowdsec.conf"
-
-        # Reiniciar Netdata para aplicar a config
-        log_info "Reiniciando Netdata para aplicar integração CrowdSec..."
-        docker restart netdata > /dev/null 2>&1
-        sleep 5
-
-        if docker ps 2>/dev/null | grep -q "netdata"; then
-            log_success "Netdata reiniciado com integração CrowdSec ativa"
-        else
-            log_warn "Netdata não respondeu após reinício — verifique manualmente"
-        fi
-    fi
-fi
-
-# ════════════════════════════════════════════════════════
-# ETAPA 4: INTEGRAÇÃO UFW/IPTABLES
-# ════════════════════════════════════════════════════════
-
-log_phase "Etapa 4/4: Integração UFW/iptables"
+log_phase "Etapa 3/3: Integração UFW/iptables"
 
 # Netdata coleta iptables via go.d — mostra pacotes bloqueados por chain/rule em tempo real
 # Útil para ver volume de ataques sendo dropados pelo UFW
@@ -252,7 +203,7 @@ log_success "Config iptables criada (nota: Ubuntu 22.04+ usa nftables — Conntr
 # ETAPA 4b: INTEGRAÇÃO FAIL2BAN
 # ════════════════════════════════════════════════════════
 
-log_phase "Etapa 4b: Integração Fail2Ban"
+log_phase "Etapa 3b: Integração Fail2Ban"
 
 # Configuração explícita do collector Fail2Ban
 cat > "${NETDATA_CONFIG_DIR}/go.d/fail2ban.conf" << 'FAIL2BAN_CONF'
@@ -292,11 +243,6 @@ echo -e "    ${COLOR_GREEN}✅${COLOR_RESET} Docker: métricas de todos os conta
 echo -e "    ${COLOR_GREEN}✅${COLOR_RESET} Traefik: requests, latência, status codes (automático)"
 echo -e "    ${COLOR_GREEN}✅${COLOR_RESET} Fail2Ban: bans ativos e jails (automático)"
 echo -e "    ${COLOR_GREEN}✅${COLOR_RESET} UFW/iptables: pacotes bloqueados por chain em tempo real"
-if command -v cscli &>/dev/null && [ -f "${NETDATA_CONFIG_DIR}/go.d/crowdsec.conf" ]; then
-    echo -e "    ${COLOR_GREEN}✅${COLOR_RESET} CrowdSec: alertas, decisões e métricas (configurado)"
-else
-    echo -e "    ${COLOR_YELLOW}⚠️  ${COLOR_RESET} CrowdSec: não configurado (CrowdSec não encontrado)"
-fi
 echo ""
 echo -e "  ${COLOR_BOLD}Arquivos:${COLOR_RESET}"
 echo -e "    • Compose:  ${NETDATA_DIR}/docker-compose.yml"

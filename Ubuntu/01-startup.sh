@@ -1213,7 +1213,6 @@ FAIL2BAN_CONF
     
     log SUCCESS "Fail2Ban configurado (porta $SSH_PORT protegida)"
     log INFO "  • Escopo: SSH brute force via Tailscale (auth.log)"
-    log INFO "  • Para proteção HTTP/bots: use CrowdSec (escopo complementar, sem conflito)"
     
     local phase_end=$(date +%s)
     local phase_duration=$((phase_end - phase_start))
