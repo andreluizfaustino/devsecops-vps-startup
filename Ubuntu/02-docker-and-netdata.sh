@@ -114,6 +114,7 @@ services:
     cap_add:
       - SYS_PTRACE
       - SYS_ADMIN
+      - NET_ADMIN
     security_opt:
       - apparmor:unconfined
     volumes:
