@@ -217,18 +217,30 @@ jobs:
           - OUTPUT
 IPTABLES_CONF
 
-log_success "Config iptables/UFW criada — Netdata monitorará pacotes por chain"
-log_info    "  • INPUT:   tráfego entrante (inclui DROPs do UFW)"
-log_info    "  • FORWARD: tráfego roteado (Docker)"
-log_info    "  • OUTPUT:  tráfego sainte"
+log_success "Config iptables criada (nota: Ubuntu 22.04+ usa nftables — Conntrack disponível em Network > Firewall)"
+
+# ════════════════════════════════════════════════════════
+# ETAPA 4b: INTEGRAÇÃO FAIL2BAN
+# ════════════════════════════════════════════════════════
+
+log_phase "Etapa 4b: Integração Fail2Ban"
+
+# Configuração explícita do collector Fail2Ban
+cat > "${NETDATA_CONFIG_DIR}/go.d/fail2ban.conf" << 'FAIL2BAN_CONF'
+jobs:
+  - name: local
+    socket: /var/run/fail2ban/fail2ban.sock
+FAIL2BAN_CONF
+
+log_success "Config Fail2Ban criada em ${NETDATA_CONFIG_DIR}/go.d/fail2ban.conf"
 
 # Reiniciar Netdata para aplicar
-log_info "Reiniciando Netdata para aplicar config iptables..."
+log_info "Reiniciando Netdata para aplicar integração Fail2Ban..."
 docker restart netdata > /dev/null 2>&1
 sleep 5
 
 if docker ps 2>/dev/null | grep -q "netdata"; then
-    log_success "Netdata reiniciado com monitoramento iptables/UFW ativo"
+    log_success "Netdata reiniciado com integração Fail2Ban ativa"
 else
     log_warn "Netdata não respondeu após reinício — verifique manualmente"
 fi
