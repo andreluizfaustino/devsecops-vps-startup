@@ -33,6 +33,11 @@ SWAP_SIZE=""
 PUB_KEY=""
 TAILSCALE_IPV4=""
 TAILSCALE_IPV6=""
+CLOUDFLARE_ONLY=""
+INSTALL_CROWDSEC=""
+INSTALL_MOD_BLOCK=""
+INSTALL_DOCKER=""
+INSTALL_MONITORING=""
 
 # Cores para output
 COLOR_RESET='\033[0m'
@@ -43,8 +48,8 @@ COLOR_BLUE='\033[0;34m'
 COLOR_CYAN='\033[0;36m'
 COLOR_BOLD='\033[1m'
 
-# Total de fases (14 fases)
-TOTAL_PHASES=14
+# Total de fases (19 fases)
+TOTAL_PHASES=20
 
 # Tempo inicial do script
 START_TIME=$(date +%s)
@@ -336,16 +341,6 @@ interactive_config() {
     INSTALL_AUDITD=${INSTALL_AUDITD:-S}
     echo ""
     
-    # AppArmor
-    echo -e "${COLOR_BOLD}[3] AppArmor${COLOR_RESET} (controle de acesso obrigatório)"
-    echo "    • MAC - limita o que processos podem fazer"
-    echo "    • 150+ perfis em modo enforce"
-    echo "    • ⚠️  ATENÇÃO: Pode causar lentidão em alguns serviços"
-    echo "    • Tempo: ~1 min"
-    read -p "    Instalar? [S/n]: " INSTALL_APPARMOR
-    INSTALL_APPARMOR=${INSTALL_APPARMOR:-S}
-    echo ""
-    
     # Logging
     echo -e "${COLOR_BOLD}[4] Logging Avançado${COLOR_RESET} (logrotate + journald)"
     echo "    • Configura rotação de logs"
@@ -354,13 +349,76 @@ interactive_config() {
     read -p "    Instalar? [S/n]: " INSTALL_LOGGING
     INSTALL_LOGGING=${INSTALL_LOGGING:-S}
     echo ""
-    
+
+    # Cloudflare-Only mode
+    echo -e "${COLOR_BOLD}[5] Modo Cloudflare-Only${COLOR_RESET} (restringe 80/443 exclusivamente aos IPs da Cloudflare)"
+    echo "    • Bloqueia scanners e ataques diretos ao IP público"
+    echo "    • HTTP/HTTPS aceitos APENAS dos ranges IPv4 e IPv6 da Cloudflare"
+    echo "    • ⚠️  Todos os domínios devem ter o proxy da Cloudflare ativo"
+    echo "    • Tempo: ~30 segundos"
+    read -p "    Ativar? [S/n]: " CLOUDFLARE_ONLY
+    CLOUDFLARE_ONLY=${CLOUDFLARE_ONLY:-S}
+    echo ""
+
+    # CrowdSec
+    echo -e "${COLOR_BOLD}[6] CrowdSec${COLOR_RESET} (IPS colaborativo — complementa o Fail2Ban)"
+    echo "    • Bloqueia bots, scanners, Tor, IPs maliciosos conhecidos"
+    echo "    • Aprende ataques colaborativamente com outros servidores do mundo"
+    echo "    • Bouncer iptables integrado + collections: linux, traefik, nginx"
+    echo "    • Escopo diferente do Fail2Ban: CrowdSec → HTTP/bots; Fail2Ban → SSH"
+    echo "    • Tempo: ~3 min"
+    read -p "    Instalar? [S/n]: " INSTALL_CROWDSEC
+    INSTALL_CROWDSEC=${INSTALL_CROWDSEC:-S}
+    echo ""
+
+    # Kernel module blocking
+    echo -e "${COLOR_BOLD}[7] Bloqueio de Módulos de Kernel${COLOR_RESET} (reduz superfície de ataque)"
+    echo "    • Desabilita protocolos não utilizados: dccp, sctp, rds, tipc"
+    echo "    • Bloqueia filesystems raramente usados em servidores"
+    echo "    • Baixo risco, melhora postura de segurança (CIS Benchmark)"
+    echo "    • Tempo: ~5 segundos"
+    read -p "    Instalar? [S/n]: " INSTALL_MOD_BLOCK
+    INSTALL_MOD_BLOCK=${INSTALL_MOD_BLOCK:-S}
+    echo ""
+
+    # Docker
+    echo -e "${COLOR_BOLD}[8] Docker${COLOR_RESET} (necessário para Netdata e seus serviços: Portainer, Coolify, Traefik)"
+    echo "    • Instala Docker Engine via script oficial (get.docker.com)"
+    echo "    • Adiciona usuário $SSH_USER ao grupo docker"
+    echo "    • Tempo: ~3 min"
+    read -p "    Instalar? [S/n]: " INSTALL_DOCKER
+    INSTALL_DOCKER=${INSTALL_DOCKER:-S}
+    echo ""
+
+    # Netdata (encadeado ao Docker)
+    INSTALL_MONITORING="N"
+    if [[ "$INSTALL_DOCKER" =~ ^[Ss]$ ]]; then
+        echo -e "${COLOR_BOLD}[8b] Netdata${COLOR_RESET} (monitoramento completo — requer Docker acima)"
+        echo "    • Host:    CPU, RAM, disco, rede, processos (via /proc e /sys)"
+        echo "    • Docker:  métricas de todos os containers (nativo via docker.sock)"
+        echo "    • Traefik: integração nativa automática"
+        echo "    • UI:      http://<IP_Tailscale>:19999 (porta protegida pelo UFW)"
+        echo "    • Tempo:   ~2 min (download da imagem)"
+        read -p "    Instalar? [S/n]: " INSTALL_MONITORING
+        INSTALL_MONITORING=${INSTALL_MONITORING:-S}
+        echo ""
+    else
+        log INFO "Netdata pulado (Docker não será instalado)"
+        echo ""
+    fi
+
     echo -e "${COLOR_GREEN}────────────────────────────────────────────────────────${COLOR_RESET}"
     echo "Resumo de componentes opcionais:"
     [[ "$INSTALL_UPGRADES" =~ ^[Ss]$ ]] && echo "  ✅ Unattended Upgrades" || echo "  ⏭️  Unattended Upgrades (pulado)"
     [[ "$INSTALL_AUDITD" =~ ^[Ss]$ ]] && echo "  ✅ Auditd" || echo "  ⏭️  Auditd (pulado)"
-    [[ "$INSTALL_APPARMOR" =~ ^[Ss]$ ]] && echo "  ✅ AppArmor" || echo "  ⏭️  AppArmor (pulado)"
     [[ "$INSTALL_LOGGING" =~ ^[Ss]$ ]] && echo "  ✅ Logging Avançado" || echo "  ⏭️  Logging Avançado (pulado)"
+    [[ "$CLOUDFLARE_ONLY" =~ ^[Ss]$ ]] && echo "  ✅ Modo Cloudflare-Only" || echo "  ⏭️  Cloudflare-Only (desativado — 80/443 público)"
+    [[ "$INSTALL_CROWDSEC" =~ ^[Ss]$ ]] && echo "  ✅ CrowdSec" || echo "  ⏭️  CrowdSec (pulado)"
+    [[ "$INSTALL_MOD_BLOCK" =~ ^[Ss]$ ]] && echo "  ✅ Bloqueio de Módulos de Kernel" || echo "  ⏭️  Bloqueio de Módulos (pulado)"
+    [[ "$INSTALL_DOCKER" =~ ^[Ss]$ ]] && echo "  ✅ Docker Engine" || echo "  ⏭️  Docker (pulado)"
+    if [[ "$INSTALL_DOCKER" =~ ^[Ss]$ ]]; then
+        [[ "$INSTALL_MONITORING" =~ ^[Ss]$ ]] && echo "  ✅ Netdata (monitoramento completo)" || echo "  ⏭️  Netdata (pulado)"
+    fi
     echo -e "${COLOR_GREEN}────────────────────────────────────────────────────────${COLOR_RESET}"
     echo ""
     
@@ -377,8 +435,12 @@ TAILSCALE_IPV4="${TAILSCALE_IPV4}"
 TAILSCALE_IPV6="${TAILSCALE_IPV6}"
 INSTALL_UPGRADES="${INSTALL_UPGRADES}"
 INSTALL_AUDITD="${INSTALL_AUDITD}"
-INSTALL_APPARMOR="${INSTALL_APPARMOR}"
 INSTALL_LOGGING="${INSTALL_LOGGING}"
+CLOUDFLARE_ONLY="${CLOUDFLARE_ONLY}"
+INSTALL_CROWDSEC="${INSTALL_CROWDSEC}"
+INSTALL_MOD_BLOCK="${INSTALL_MOD_BLOCK}"
+INSTALL_DOCKER="${INSTALL_DOCKER}"
+INSTALL_MONITORING="${INSTALL_MONITORING}"
 EOF
     chmod 600 "${SCRIPT_DIR}/.startup-config"
 }
@@ -622,11 +684,20 @@ phase_network_hardening() {
 # ════════════════════════════════════════════════════════
 net.ipv4.ip_forward = 0
 net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
 net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ratelimit = 100
 net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_rfc1337 = 1
+net.ipv4.tcp_timestamps = 0
+net.ipv4.tcp_synack_retries = 2
 
 # ════════════════════════════════════════════════════════
 # TCP Performance Tuning (APIs de alto tráfego)
@@ -675,9 +746,35 @@ NET_CONF
         log WARNING "BBR não disponível (kernel < 4.9) - usando CUBIC"
     fi
     
+    # Configurar conntrack (Camada 3 — proteção contra DDoS por esgotamento de tabela)
+    log INFO "Configurando conntrack (nf_conntrack)..."
+    modprobe nf_conntrack 2>/dev/null || true
+    if [ -d /proc/sys/net/netfilter ]; then
+        cat > /etc/sysctl.d/60-conntrack.conf << 'CONNTRACK_CONF'
+# ════════════════════════════════════════════════════════
+# Conntrack — Proteção contra DDoS por flood de conexões
+# ════════════════════════════════════════════════════════
+# Tabela pode suportar 1M conexões simultâneas
+net.netfilter.nf_conntrack_max = 1048576
+# Conexões estabelecidas: expiram em 24h
+net.netfilter.nf_conntrack_tcp_timeout_established = 86400
+# SYN_RECV: reduzido para 15s (mitiga SYN flood)
+net.netfilter.nf_conntrack_tcp_timeout_syn_recv = 15
+# TIME_WAIT: reduzido para liberar slots mais rápido
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 15
+# CLOSE_WAIT: reduzido para 30s
+net.netfilter.nf_conntrack_tcp_timeout_close_wait = 30
+CONNTRACK_CONF
+        sysctl -p /etc/sysctl.d/60-conntrack.conf 2>&1 | tee -a "$LOG_FILE"
+        log SUCCESS "Conntrack configurado:"
+        log SUCCESS "  • Tabela: 1M conexões simultâneas"
+        log SUCCESS "  • Timeouts reduzidos: syn_recv=15s, time_wait=15s, close_wait=30s"
+    else
+        log WARNING "nf_conntrack não disponível agora — será ativado após reboot"
+    fi
+
     # Configurar file descriptor limits (user level)
-    log INFO "Configurando file descriptor limits..."
-    
+
     # /etc/security/limits.conf
     if ! grep -q "^* soft nofile 1048576" /etc/security/limits.conf 2>/dev/null; then
         cat >> /etc/security/limits.conf << 'LIMITS_EOF'
@@ -1172,6 +1269,8 @@ FAIL2BAN_CONF
     systemctl restart fail2ban 2>&1 | tee -a "$LOG_FILE"
     
     log SUCCESS "Fail2Ban configurado (porta $SSH_PORT protegida)"
+    log INFO "  • Escopo: SSH brute force via Tailscale (auth.log)"
+    log INFO "  • Para proteção HTTP/bots: use CrowdSec (escopo complementar, sem conflito)"
     
     local phase_end=$(date +%s)
     local phase_duration=$((phase_end - phase_start))
@@ -1197,6 +1296,13 @@ phase_firewall_ufw() {
         apt install -y -qq ufw >> "$LOG_FILE" 2>&1
     fi
     
+    # Garantir que UFW suporte IPv6
+    log INFO "Garantindo suporte a IPv6 no UFW..."
+    if [ -f /etc/default/ufw ]; then
+        sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
+        log SUCCESS "✅ IPv6 habilitado no UFW"
+    fi
+
     # Resetar regras (limpar configurações anteriores)
     log INFO "Resetando configurações do UFW..."
     ufw --force reset >> "$LOG_FILE" 2>&1
@@ -1206,11 +1312,56 @@ phase_firewall_ufw() {
     ufw default deny incoming >> "$LOG_FILE" 2>&1
     ufw default allow outgoing >> "$LOG_FILE" 2>&1
     
-    # Permitir HTTP e HTTPS (acesso público) - APENAS ESTAS PORTAS
-    log INFO "Liberando portas HTTP/HTTPS (acesso público)..."
-    ufw allow 80/tcp comment 'HTTP - public' >> "$LOG_FILE" 2>&1
-    ufw allow 443/tcp comment 'HTTPS - public' >> "$LOG_FILE" 2>&1
-    log SUCCESS "✅ Portas 80 (HTTP) e 443 (HTTPS) liberadas para acesso público"
+    # Permitir HTTP e HTTPS — modo Cloudflare-Only ou público
+    if [[ "$CLOUDFLARE_ONLY" =~ ^[Ss]$ ]]; then
+        log INFO "Modo Cloudflare-Only: liberando 80/443 APENAS para IPs da Cloudflare (IPv4 + IPv6)..."
+
+        # Cloudflare IPv4 ranges (fonte: https://www.cloudflare.com/ips/)
+        CF_IPV4_RANGES=(
+            "173.245.48.0/20"
+            "103.21.244.0/22"
+            "103.22.200.0/22"
+            "103.31.4.0/22"
+            "141.101.64.0/18"
+            "108.162.192.0/18"
+            "190.93.240.0/20"
+            "188.114.96.0/20"
+            "197.234.240.0/22"
+            "198.41.128.0/17"
+            "162.158.0.0/15"
+            "104.16.0.0/13"
+            "104.24.0.0/14"
+            "172.64.0.0/13"
+            "131.0.72.0/22"
+        )
+        for cf_ip in "${CF_IPV4_RANGES[@]}"; do
+            ufw allow from "$cf_ip" to any port 80 proto tcp comment 'Cloudflare IPv4' >> "$LOG_FILE" 2>&1
+            ufw allow from "$cf_ip" to any port 443 proto tcp comment 'Cloudflare IPv4' >> "$LOG_FILE" 2>&1
+        done
+
+        # Cloudflare IPv6 ranges
+        CF_IPV6_RANGES=(
+            "2400:cb00::/32"
+            "2606:4700::/32"
+            "2803:f800::/32"
+            "2405:b500::/32"
+            "2405:8100::/32"
+            "2a06:98c0::/29"
+            "2c0f:f248::/32"
+        )
+        for cf_ip in "${CF_IPV6_RANGES[@]}"; do
+            ufw allow from "$cf_ip" to any port 80 proto tcp comment 'Cloudflare IPv6' >> "$LOG_FILE" 2>&1
+            ufw allow from "$cf_ip" to any port 443 proto tcp comment 'Cloudflare IPv6' >> "$LOG_FILE" 2>&1
+        done
+
+        log SUCCESS "✅ HTTP/HTTPS liberados APENAS para IPs da Cloudflare (15 ranges IPv4 + 7 IPv6)"
+        log WARNING "  ⚠️  Certifique-se que todos os domínios têm o proxy da Cloudflare ativo"
+    else
+        log INFO "Liberando portas HTTP/HTTPS (acesso público)..."
+        ufw allow 80/tcp comment 'HTTP - public' >> "$LOG_FILE" 2>&1
+        ufw allow 443/tcp comment 'HTTPS - public' >> "$LOG_FILE" 2>&1
+        log SUCCESS "✅ Portas 80 (HTTP) e 443 (HTTPS) liberadas para acesso público"
+    fi
     
     # Permitir TUDO via Tailscale (VPN privada)
     log INFO "Liberando interface Tailscale (acesso total via VPN)..."
@@ -1224,22 +1375,34 @@ phase_firewall_ufw() {
     echo -e "${COLOR_BOLD}${COLOR_YELLOW}════════════════════════════════════════════════════════${COLOR_RESET}"
     echo ""
     echo "Regras configuradas:"
-    echo "  ✅ HTTP: 80/tcp (PÚBLICO - sites/APIs)"
-    echo "  ✅ HTTPS: 443/tcp (PÚBLICO - sites/APIs)"
+    if [[ "$CLOUDFLARE_ONLY" =~ ^[Ss]$ ]]; then
+        echo "  ✅ HTTP: 80/tcp  (APENAS IPs Cloudflare — 15 ranges IPv4 + 7 IPv6)"
+        echo "  ✅ HTTPS: 443/tcp (APENAS IPs Cloudflare — 15 ranges IPv4 + 7 IPv6)"
+    else
+        echo "  ✅ HTTP: 80/tcp (PÚBLICO - sites/APIs)"
+        echo "  ✅ HTTPS: 443/tcp (PÚBLICO - sites/APIs)"
+    fi
     echo "  ✅ SSH: porta $SSH_PORT (APENAS via Tailscale)"
     echo "  ✅ Todas outras portas: (APENAS via Tailscale)"
     echo "  ❌ Política padrão: DENY (bloqueia acesso público)"
     echo ""
     echo -e "${COLOR_RED}${COLOR_BOLD}IMPORTANTE:${COLOR_RESET}"
-    echo "  • Acesso público: APENAS HTTP (80) e HTTPS (443)"
+    if [[ "$CLOUDFLARE_ONLY" =~ ^[Ss]$ ]]; then
+        echo "  • Acesso HTTP/HTTPS: APENAS via Cloudflare proxy"
+        echo "  • Ataques diretos ao IP em 80/443 serão DROP silencioso"
+    else
+        echo "  • Acesso público: APENAS HTTP (80) e HTTPS (443)"
+    fi
     echo "  • SSH, painéis, DBs, etc: APENAS via Tailscale VPN"
     echo "  • Conecte via: ssh $SSH_USER@$TAILSCALE_IPV4 -p $SSH_PORT"
     echo "  • Para acessar outras portas, conecte primeiro ao Tailscale"
     echo ""
     
-    # Habilitar UFW (sem confirmação)
+    # Habilitar UFW e configurar logging
     log WARNING "Habilitando UFW..."
     ufw --force enable >> "$LOG_FILE" 2>&1
+    ufw logging medium >> "$LOG_FILE" 2>&1
+    log SUCCESS "✅ UFW logging configurado em modo medium (loga pacotes bloqueados por regra + política)"
     
     # Verificar status
     if ufw status | grep -q "Status: active"; then
@@ -1316,32 +1479,50 @@ AUDIT_RULES
     show_progress
 }
 
-phase_apparmor() {
-    local PHASE="apparmor"
+# ════════════════════════════════════════════════════════
+# FASE: DOCKER
+# ════════════════════════════════════════════════════════
+
+phase_docker() {
+    local PHASE="docker"
     if is_phase_completed "$PHASE"; then
         log INFO "Fase '$PHASE' já concluída. Pulando..."
         return 0
     fi
-    
-    log PHASE "Fase 14/14: Ativar AppArmor"
+
+    log PHASE "Instalando Docker Engine"
     local phase_start=$(date +%s)
-    
-    # Instalar apparmor-utils se não estiver instalado
-    if ! command -v aa-enforce &> /dev/null; then
-        log INFO "Instalando apparmor-utils..."
-        apt install -y -qq apparmor-utils >> "$LOG_FILE" 2>&1
+
+    log INFO "Instalando Docker via script oficial (get.docker.com)..."
+    if curl -fsSL https://get.docker.com | sh >> "$LOG_FILE" 2>&1; then
+        log SUCCESS "Docker instalado com sucesso"
+    else
+        log ERROR "Falha ao instalar Docker"
+        exit 1
     fi
-    
-    systemctl enable apparmor 2>&1 | tee -a "$LOG_FILE"
-    systemctl start apparmor 2>&1 | tee -a "$LOG_FILE"
-    aa-enforce /etc/apparmor.d/* 2>&1 | tee -a "$LOG_FILE" || true
-    
-    log SUCCESS "AppArmor ativado"
-    
+
+    # Adicionar usuário ao grupo docker (evita precisar de sudo para cada comando)
+    if [ -n "$SSH_USER" ] && [ "$SSH_USER" != "root" ]; then
+        usermod -aG docker "$SSH_USER" 2>&1 | tee -a "$LOG_FILE"
+        log SUCCESS "Usuário $SSH_USER adicionado ao grupo docker"
+        log INFO    "  ⚠️  Para aplicar sem reboot: newgrp docker (ou reconectar)"
+    fi
+
+    systemctl enable docker  2>&1 | tee -a "$LOG_FILE"
+    systemctl start  docker  2>&1 | tee -a "$LOG_FILE"
+
+    if docker info &>/dev/null; then
+        log SUCCESS "Docker Engine rodando:"
+        docker version --format 'Engine: {{.Server.Version}}' 2>/dev/null | tee -a "$LOG_FILE" || true
+    else
+        log ERROR "Docker instalado mas não está respondendo"
+        exit 1
+    fi
+
     local phase_end=$(date +%s)
     local phase_duration=$((phase_end - phase_start))
     log SUCCESS "Fase concluída em $(format_time $phase_duration) | Tempo total: $(get_elapsed_time)"
-    
+
     mark_phase_completed "$PHASE"
     show_progress
 }
@@ -1384,6 +1565,315 @@ EOF_LOGROTATE
 }
 
 # ════════════════════════════════════════════════════════
+# FASE: CROWDSEC
+# ════════════════════════════════════════════════════════
+
+phase_crowdsec() {
+    local PHASE="crowdsec"
+    if is_phase_completed "$PHASE"; then
+        log INFO "Fase '$PHASE' já concluída. Pulando..."
+        return 0
+    fi
+
+    log PHASE "Instalando CrowdSec (IPS colaborativo)"
+    local phase_start=$(date +%s)
+
+    log INFO "Instalando CrowdSec via script oficial..."
+    curl -s https://install.crowdsec.net | sh >> "$LOG_FILE" 2>&1
+
+    log INFO "Instalando bouncer iptables (bloqueia IPs maliciosos em tempo real)..."
+    apt install -y -qq crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1
+
+    log INFO "Instalando collections de segurança..."
+    cscli collections install crowdsecurity/linux     >> "$LOG_FILE" 2>&1 || true
+    cscli collections install crowdsecurity/traefik   >> "$LOG_FILE" 2>&1 || true
+    cscli collections install crowdsecurity/nginx     >> "$LOG_FILE" 2>&1 || true
+
+    systemctl enable crowdsec                         2>&1 | tee -a "$LOG_FILE"
+    systemctl restart crowdsec                        2>&1 | tee -a "$LOG_FILE"
+    systemctl enable crowdsec-firewall-bouncer        2>&1 | tee -a "$LOG_FILE"
+    systemctl restart crowdsec-firewall-bouncer       2>&1 | tee -a "$LOG_FILE"
+
+    log SUCCESS "CrowdSec instalado e configurado"
+    log SUCCESS "  • Bouncer iptables: bloqueia IPs maliciosos automaticamente"
+    log SUCCESS "  • Collections ativas: linux, traefik, nginx"
+    log SUCCESS "  • Inteligência compartilhada com toda a comunidade CrowdSec"
+    log INFO    "  • Relação com Fail2Ban: escopos diferentes, sem conflito"
+    log INFO    "    - Fail2Ban  → SSH brute force (auth.log)"
+    log INFO    "    - CrowdSec  → HTTP, bots, scanners, IPs de reputação ruim"
+    log INFO    "  • Comandos úteis:"
+    log INFO    "    - cscli decisions list   (IPs bloqueados)"
+    log INFO    "    - cscli alerts list      (alertas recentes)"
+    log INFO    "    - cscli metrics          (estatísticas)"
+    log INFO    "    - cscli hub update       (atualizar threat intelligence)"
+
+    local phase_end=$(date +%s)
+    local phase_duration=$((phase_end - phase_start))
+    log SUCCESS "Fase concluída em $(format_time $phase_duration) | Tempo total: $(get_elapsed_time)"
+
+    mark_phase_completed "$PHASE"
+    show_progress
+}
+
+# ════════════════════════════════════════════════════════
+# FASE: BLOQUEIO DE MÓDULOS DE KERNEL
+# ════════════════════════════════════════════════════════
+
+phase_kernel_modules() {
+    local PHASE="kernel_modules"
+    if is_phase_completed "$PHASE"; then
+        log INFO "Fase '$PHASE' já concluída. Pulando..."
+        return 0
+    fi
+
+    log PHASE "Bloqueando módulos de kernel desnecessários (CIS Benchmark)"
+    local phase_start=$(date +%s)
+
+    cat > /etc/modprobe.d/blacklist-hardening.conf << 'MOD_CONF'
+# ════════════════════════════════════════════════════════
+# Módulos de kernel bloqueados — reduz superfície de ataque
+# Gerado pelo script de hardening
+# ════════════════════════════════════════════════════════
+
+# Protocolos de rede não utilizados em servidores
+install dccp /bin/true
+install sctp /bin/true
+install rds  /bin/true
+install tipc /bin/true
+
+# Filesystems raramente usados em ambientes de servidor
+install cramfs  /bin/true
+install freevxfs /bin/true
+install jffs2   /bin/true
+install hfs     /bin/true
+install hfsplus /bin/true
+install udf     /bin/true
+MOD_CONF
+
+    # Recarregar initramfs para garantir aplicação no próximo boot
+    if command -v update-initramfs &> /dev/null; then
+        update-initramfs -u >> "$LOG_FILE" 2>&1 || true
+    fi
+
+    log SUCCESS "Módulos de kernel bloqueados:"
+    log SUCCESS "  • Protocolos de rede: dccp, sctp, rds, tipc"
+    log SUCCESS "  • Filesystems desnecessários: cramfs, freevxfs, jffs2, hfs, hfsplus, udf"
+    log WARNING "  ⚠️  Efeito total após reboot (será feito automaticamente ao final)"
+
+    local phase_end=$(date +%s)
+    local phase_duration=$((phase_end - phase_start))
+    log SUCCESS "Fase concluída em $(format_time $phase_duration) | Tempo total: $(get_elapsed_time)"
+
+    mark_phase_completed "$PHASE"
+    show_progress
+}
+
+# ════════════════════════════════════════════════════════
+# FASE: MONITORAMENTO
+# ════════════════════════════════════════════════════════
+
+phase_monitoring() {
+    local PHASE="monitoring"
+    if is_phase_completed "$PHASE"; then
+        log INFO "Fase '$PHASE' já concluída. Pulando..."
+        return 0
+    fi
+
+    log PHASE "Instalando Netdata (monitoramento: host + Docker em 1 container)"
+    local phase_start=$(date +%s)
+
+    NETDATA_DIR="/opt/netdata"
+    mkdir -p "$NETDATA_DIR"
+
+    # Docker Compose — Netdata cobre host + Docker + Traefik em 1 container
+    cat > "$NETDATA_DIR/docker-compose.yml" << 'NETDATA_COMPOSE'
+version: '3.8'
+
+services:
+  netdata:
+    image: netdata/netdata:latest
+    container_name: netdata
+    restart: unless-stopped
+    pid: host
+    network_mode: host
+    cap_add:
+      - SYS_PTRACE
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    volumes:
+      - netdata_config:/etc/netdata
+      - netdata_lib:/var/lib/netdata
+      - netdata_cache:/var/cache/netdata
+      - /:/host/root:ro,rslave
+      - /etc/passwd:/host/etc/passwd:ro
+      - /etc/group:/host/etc/group:ro
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /etc/os-release:/host/etc/os-release:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - DOCKER_HOST=unix:///var/run/docker.sock
+
+volumes:
+  netdata_config: {}
+  netdata_lib: {}
+  netdata_cache: {}
+NETDATA_COMPOSE
+
+    log INFO "Iniciando Netdata (download da imagem pode demorar)..."
+    cd "$NETDATA_DIR" && docker compose up -d >> "$LOG_FILE" 2>&1
+
+    sleep 5
+
+    if docker ps 2>/dev/null | grep -q "netdata"; then
+        log SUCCESS "Netdata iniciado com sucesso!"
+        log SUCCESS "  • Host:    CPU, RAM, disco, rede, processos (via /proc e /sys)"
+        log SUCCESS "  • Docker:  métricas de todos os containers (via docker.sock)"
+        log SUCCESS "  • Traefik: integração nativa (ativa automaticamente)"
+        log SUCCESS "  • UI:      http://${TAILSCALE_IPV4}:19999 (acesso via Tailscale)"
+        log WARNING "  ⚠️  Porta 19999 protegida pelo UFW — acessível APENAS via Tailscale"
+        log INFO    "  • Arquivos em: $NETDATA_DIR"
+        log INFO    "  • Dados persistidos em volumes Docker: netdata_config, netdata_lib, netdata_cache"
+    else
+        log WARNING "Netdata pode não ter iniciado corretamente"
+        log INFO    "  Verifique: docker compose -f $NETDATA_DIR/docker-compose.yml ps"
+        log INFO    "  Logs: docker compose -f $NETDATA_DIR/docker-compose.yml logs"
+    fi
+
+    local phase_end=$(date +%s)
+    local phase_duration=$((phase_end - phase_start))
+    log SUCCESS "Fase concluída em $(format_time $phase_duration) | Tempo total: $(get_elapsed_time)"
+
+    mark_phase_completed "$PHASE"
+    show_progress
+}
+
+# ════════════════════════════════════════════════════════
+# FASE: CLOUDFLARE IP UPDATER
+# ════════════════════════════════════════════════════════
+
+phase_cloudflare_updater() {
+    local PHASE="cloudflare_updater"
+    if is_phase_completed "$PHASE"; then
+        log INFO "Fase '$PHASE' já concluída. Pulando..."
+        return 0
+    fi
+
+    log PHASE "Configurando serviço de atualização semanal de IPs da Cloudflare"
+    local phase_start=$(date +%s)
+
+    # Script de atualização
+    cat > /usr/local/bin/cf-update-ufw.sh << 'CF_SCRIPT'
+#!/bin/bash
+# Atualiza regras UFW com os IPs atuais da Cloudflare
+# Executado semanalmente via systemd timer
+# Fonte: https://www.cloudflare.com/ips-v4 e https://www.cloudflare.com/ips-v6
+
+set -euo pipefail
+
+LOG="/var/log/cf-update-ufw.log"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Iniciando atualização de IPs da Cloudflare..." >> "$LOG"
+
+# Buscar IPs atuais da Cloudflare
+CF_IPV4=$(curl -s --max-time 30 https://www.cloudflare.com/ips-v4 2>/dev/null | grep -E '^[0-9]')
+CF_IPV6=$(curl -s --max-time 30 https://www.cloudflare.com/ips-v6 2>/dev/null | grep -E '^[0-9a-f2]')
+
+if [ -z "$CF_IPV4" ] || [ -z "$CF_IPV6" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERRO: falha ao buscar IPs da Cloudflare. Regras mantidas." >> "$LOG"
+    exit 1
+fi
+
+# Remover regras antigas da Cloudflare (por número, de trás para frente para não deslocar índices)
+ufw status numbered 2>/dev/null \
+    | grep -E 'Cloudflare' \
+    | awk -F'[][]' '{print $2}' \
+    | sort -rn \
+    | while read -r num; do
+        ufw --force delete "$num" >> "$LOG" 2>&1 || true
+    done
+
+# Adicionar regras IPv4
+while IFS= read -r ip; do
+    [ -z "$ip" ] && continue
+    ufw allow from "$ip" to any port 80  proto tcp comment 'Cloudflare IPv4' >> "$LOG" 2>&1
+    ufw allow from "$ip" to any port 443 proto tcp comment 'Cloudflare IPv4' >> "$LOG" 2>&1
+done <<< "$CF_IPV4"
+
+# Adicionar regras IPv6
+while IFS= read -r ip; do
+    [ -z "$ip" ] && continue
+    ufw allow from "$ip" to any port 80  proto tcp comment 'Cloudflare IPv6' >> "$LOG" 2>&1
+    ufw allow from "$ip" to any port 443 proto tcp comment 'Cloudflare IPv6' >> "$LOG" 2>&1
+done <<< "$CF_IPV6"
+
+IPV4_COUNT=$(echo "$CF_IPV4" | wc -l)
+IPV6_COUNT=$(echo "$CF_IPV6" | wc -l)
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Concluído: ${IPV4_COUNT} ranges IPv4, ${IPV6_COUNT} ranges IPv6." >> "$LOG"
+CF_SCRIPT
+
+    chmod +x /usr/local/bin/cf-update-ufw.sh
+
+    # Systemd service (execução única)
+    cat > /etc/systemd/system/cf-update-ufw.service << 'CF_SERVICE'
+[Unit]
+Description=Atualizar regras UFW com IPs da Cloudflare
+After=network-online.target ufw.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cf-update-ufw.sh
+StandardOutput=journal
+StandardError=journal
+CF_SERVICE
+
+    # Systemd timer (semanal)
+    cat > /etc/systemd/system/cf-update-ufw.timer << 'CF_TIMER'
+[Unit]
+Description=Atualização semanal dos IPs da Cloudflare no UFW
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=3600
+
+[Install]
+WantedBy=timers.target
+CF_TIMER
+
+    systemctl daemon-reload                  2>&1 | tee -a "$LOG_FILE"
+    systemctl enable cf-update-ufw.timer     2>&1 | tee -a "$LOG_FILE"
+    systemctl start  cf-update-ufw.timer     2>&1 | tee -a "$LOG_FILE"
+
+    # Executar imediatamente para validar
+    log INFO "Executando primeira atualização de IPs..."
+    if systemctl start cf-update-ufw.service 2>&1 | tee -a "$LOG_FILE"; then
+        log SUCCESS "IPs da Cloudflare atualizados com sucesso"
+        if [ -f /var/log/cf-update-ufw.log ]; then
+            tail -3 /var/log/cf-update-ufw.log | tee -a "$LOG_FILE"
+        fi
+    else
+        log WARNING "Primeira execução com erro — verifique: journalctl -u cf-update-ufw.service"
+        log WARNING "O timer tentará novamente na próxima semana automaticamente"
+    fi
+
+    log SUCCESS "Serviço configurado:"
+    log SUCCESS "  • Script:  /usr/local/bin/cf-update-ufw.sh"
+    log SUCCESS "  • Timer:   semanal (toda segunda-feira à meia-noite ±1h)"
+    log SUCCESS "  • Log:     /var/log/cf-update-ufw.log"
+    log INFO    "  • Execução manual: systemctl start cf-update-ufw.service"
+    log INFO    "  • Próxima execução: systemctl status cf-update-ufw.timer"
+
+    local phase_end=$(date +%s)
+    local phase_duration=$((phase_end - phase_start))
+    log SUCCESS "Fase concluída em $(format_time $phase_duration) | Tempo total: $(get_elapsed_time)"
+
+    mark_phase_completed "$PHASE"
+    show_progress
+}
+
+# ════════════════════════════════════════════════════════
 # RESUMO FINAL
 # ════════════════════════════════════════════════════════
 
@@ -1407,8 +1897,10 @@ show_summary() {
     echo ""
     echo "  🌐 Hardening de Rede:"
     echo "    • IP forwarding desabilitado"
-    echo "    • ICMP redirects bloqueados"
-    echo "    • SYN cookies habilitados"
+    echo "    • ICMP/TCP redirects bloqueados (IPv4 + IPv6)"
+    echo "    • Reverse path filter ativado (anti-spoofing)"
+    echo "    • SYN cookies + tcp_rfc1337 + synack_retries=2"
+    echo "    • Conntrack: 1M conexões, timeouts reduzidos"
     echo "    • BBR congestion control ativo"
     echo "    • File descriptors: 1M"
     echo ""
@@ -1428,15 +1920,30 @@ show_summary() {
     echo "    • Status: Conectado"
     echo ""
     echo "  🛡️  Firewall UFW:"
-    echo "    • HTTP (80): PÚBLICO"
-    echo "    • HTTPS (443): PÚBLICO"
+    if [[ "$CLOUDFLARE_ONLY" =~ ^[Ss]$ ]]; then
+        echo "    • HTTP (80):  APENAS Cloudflare IPs (15 IPv4 + 7 IPv6 ranges)"
+        echo "    • HTTPS (443): APENAS Cloudflare IPs (15 IPv4 + 7 IPv6 ranges)"
+    else
+        echo "    • HTTP (80): PÚBLICO"
+        echo "    • HTTPS (443): PÚBLICO"
+    fi
     echo "    • SSH ($SSH_PORT): APENAS VIA TAILSCALE"
     echo "    • Outras portas: APENAS VIA TAILSCALE"
+    echo "    • IPv6: HABILITADO"
     echo ""
     echo "  🔍 Sistemas de Detecção:"
     [[ "$INSTALL_AUDITD" =~ ^[Ss]$ ]] && echo "    • Auditd: ATIVO (otimizado)"
-    echo "    • Fail2Ban: ATIVO"
-    [[ "$INSTALL_APPARMOR" =~ ^[Ss]$ ]] && echo "    • AppArmor: ATIVO"
+    echo "    • Fail2Ban: ATIVO (escopo: SSH)"
+    [[ "$INSTALL_CROWDSEC" =~ ^[Ss]$ ]] && echo "    • CrowdSec: ATIVO (escopo: HTTP/bots/scanners)"
+    [[ "$INSTALL_MOD_BLOCK" =~ ^[Ss]$ ]] && echo "    • Módulos kernel bloqueados: dccp, sctp, rds, tipc"
+    echo ""
+    echo "  🐳 Infraestrutura:"
+    if [[ "$INSTALL_DOCKER" =~ ^[Ss]$ ]]; then
+        echo "    • Docker Engine: INSTALADO"
+        [[ "$INSTALL_MONITORING" =~ ^[Ss]$ ]] && echo "    • Netdata: ATIVO — http://${TAILSCALE_IPV4}:19999"
+    else
+        echo "    • Docker: não instalado"
+    fi
     echo ""
     echo "  📋 Logs: /var/log/"
     echo ""
@@ -1446,10 +1953,29 @@ show_summary() {
     echo "  🔐 Acesso SSH (APENAS via Tailscale):"
     echo "    ssh $SSH_USER@$TAILSCALE_IPV4 -p $SSH_PORT"
     echo ""
-    echo "  🌐 Acesso Web (Público):"
-    echo "    • HTTP: http://SEU_IP_PUBLICO"
-    echo "    • HTTPS: https://SEU_IP_PUBLICO"
+    echo "  🌐 Acesso Web:"
+    if [[ "$CLOUDFLARE_ONLY" =~ ^[Ss]$ ]]; then
+        echo "    • HTTP/HTTPS: via Cloudflare proxy APENAS"
+        echo "    • Acesso direto ao IP bloqueado (Cloudflare-Only ativo)"
+    else
+        echo "    • HTTP: http://SEU_IP_PUBLICO"
+        echo "    • HTTPS: https://SEU_IP_PUBLICO"
+    fi
     echo ""
+    if [[ "$INSTALL_MONITORING" =~ ^[Ss]$ ]]; then
+        echo "  📊 Monitoramento Netdata (via Tailscale):"
+        echo "    • UI:    http://${TAILSCALE_IPV4}:19999"
+        echo "    • Cobre: servidor, Docker containers e Traefik"
+        echo "    • Dados: /opt/netdata/"
+        echo ""
+    fi
+    if [[ "$CLOUDFLARE_ONLY" =~ ^[Ss]$ ]]; then
+        echo "  🔄 Cloudflare IP Updater:"
+        echo "    • Timer: semanal (toda segunda-feira ±1h)"
+        echo "    • Log:   /var/log/cf-update-ufw.log"
+        echo "    • Manual: systemctl start cf-update-ufw.service"
+        echo ""
+    fi
     echo "  📝 Logs deste script:"
     echo "    • Log completo: $LOG_FILE"
     echo "    • Log de erros: $ERROR_LOG"
@@ -1473,8 +1999,9 @@ Tailscale VPN:
   Interface: tailscale0
 
 Firewall UFW:
-  • Portas públicas: 80 (HTTP), 443 (HTTPS)
+  • HTTP/HTTPS (80/443): $([ "$CLOUDFLARE_ONLY" = "S" ] && echo "APENAS IPs Cloudflare" || echo "PÚBLICO")
   • Outras portas: APENAS via Tailscale
+  • Cloudflare IP Updater: $([ "$CLOUDFLARE_ONLY" = "S" ] && echo "Ativo (semanal) — /var/log/cf-update-ufw.log" || echo "Desativado")
 
 Sistema:
   • Timezone: America/Sao_Paulo
@@ -1484,7 +2011,12 @@ Sistema:
 Segurança:
   • Fail2Ban: Ativo
   • Auditd: $([ "$INSTALL_AUDITD" = "S" ] && echo "Ativo" || echo "Desativado")
-  • AppArmor: $([ "$INSTALL_APPARMOR" = "S" ] && echo "Ativo" || echo "Desativado")
+
+Infraestrutura:
+  • Docker: $([[ "$INSTALL_DOCKER" =~ ^[Ss]$ ]] && echo "Instalado" || echo "Não instalado")
+
+Monitoramento:
+  • Netdata: $([ "$INSTALL_MONITORING" = "S" ] && echo "Ativo — http://${TAILSCALE_IPV4}:19999" || echo "Desativado")
 
 Logs do script:
   • $LOG_FILE
@@ -1574,46 +2106,56 @@ main() {
     phase_tailscale  # Fase 9: Instalar Tailscale
     phase_ssh_config # Fase 10: Configurar SSH para escutar apenas no Tailscale
     phase_fail2ban
-    phase_firewall_ufw # Fase 12: UFW - 80, 443 público + resto via Tailscale
-    
+    phase_firewall_ufw # Fase 12: UFW - 80/443 (Cloudflare-only ou público) + resto via Tailscale
+
+    if [[ "$CLOUDFLARE_ONLY" =~ ^[Ss]$ ]]; then
+        phase_cloudflare_updater
+    else
+        log INFO "⏭️  Pulando serviço de atualização Cloudflare (Cloudflare-Only desativado)"
+        mark_phase_completed "cloudflare_updater"
+    fi
+
+    if [[ "$INSTALL_CROWDSEC" =~ ^[Ss]$ ]]; then
+        phase_crowdsec
+    else
+        log INFO "⏭️  Pulando CrowdSec (opcional)"
+        mark_phase_completed "crowdsec"
+    fi
+
+    if [[ "$INSTALL_MOD_BLOCK" =~ ^[Ss]$ ]]; then
+        phase_kernel_modules
+    else
+        log INFO "⏭️  Pulando bloqueio de módulos de kernel (opcional)"
+        mark_phase_completed "kernel_modules"
+    fi
+
     if [[ "$INSTALL_AUDITD" =~ ^[Ss]$ ]]; then
         phase_auditd
     else
         log INFO "⏭️  Pulando Auditd (opcional)"
         mark_phase_completed "auditd"
     fi
-    
-    if [[ "$INSTALL_APPARMOR" =~ ^[Ss]$ ]]; then
-        phase_apparmor
-    else
-        log INFO "⏭️  Pulando AppArmor (opcional) - Desativando AppArmor do sistema..."
-        
-        # Desativar AppArmor completamente quando não for instalado
-        if systemctl is-active --quiet apparmor 2>/dev/null; then
-            log INFO "Parando serviço AppArmor..."
-            systemctl stop apparmor 2>&1 | tee -a "$LOG_FILE"
-        fi
-        
-        if systemctl is-enabled --quiet apparmor 2>/dev/null; then
-            log INFO "Desabilitando AppArmor da inicialização..."
-            systemctl disable apparmor 2>&1 | tee -a "$LOG_FILE"
-        fi
-        
-        # Remover profiles da memória
-        if command -v aa-teardown &> /dev/null; then
-            log INFO "Removendo profiles AppArmor da memória..."
-            aa-teardown 2>&1 | tee -a "$LOG_FILE" || true
-        fi
-        
-        log SUCCESS "✅ AppArmor desativado completamente"
-        mark_phase_completed "apparmor"
-    fi
-    
+
     if [[ "$INSTALL_LOGGING" =~ ^[Ss]$ ]]; then
         phase_logging
     else
         log INFO "⏭️  Pulando Logging Avançado (opcional)"
         mark_phase_completed "logging"
+    fi
+
+    if [[ "$INSTALL_DOCKER" =~ ^[Ss]$ ]]; then
+        phase_docker
+        if [[ "$INSTALL_MONITORING" =~ ^[Ss]$ ]]; then
+            phase_monitoring
+        else
+            log INFO "⏭️  Pulando Netdata (opcional)"
+            mark_phase_completed "monitoring"
+        fi
+    else
+        log INFO "⏭️  Pulando Docker (opcional)"
+        mark_phase_completed "docker"
+        log INFO "⏭️  Pulando Netdata (Docker não instalado)"
+        mark_phase_completed "monitoring"
     fi
     
     # Progress bar final

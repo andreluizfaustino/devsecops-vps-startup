@@ -4,58 +4,115 @@
 [![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04%20%7C%2024.04-orange?logo=ubuntu)](https://ubuntu.com/)
 [![Bash](https://img.shields.io/badge/Bash-5.0+-green?logo=gnu-bash)](https://www.gnu.org/software/bash/)
 [![Tailscale](https://img.shields.io/badge/Tailscale-VPN-blue?logo=tailscale)](https://tailscale.com/)
+[![Cloudflare](https://img.shields.io/badge/Cloudflare-Ready-orange?logo=cloudflare)](https://cloudflare.com/)
 
-Script automatizado de hardening para servidores Ubuntu VPS com **14 fases de segurança**, integração com **Tailscale VPN** e sistema de checkpoint para retomar execução em caso de falha.
+Script automatizado de hardening para servidores Ubuntu VPS com **20 fases de segurança**, integração com **Tailscale VPN**, modo **Cloudflare-Only** e sistema de checkpoint para retomar execução em caso de falha.
 
 **🎯 Economia: 85-90% do tempo vs. configuração manual**  
-**⏱️ Tempo de execução: ~15-20 minutos**
+**⏱️ Tempo de execução: ~20-30 minutos**
 
 ---
 
 ## 📋 Índice
 
+- [Arquitetura de Segurança](#-arquitetura-de-segurança)
 - [Features](#-features)
 - [Para Quem é Este Script](#-para-quem-é-este-script)
 - [Pré-requisitos](#-pré-requisitos)
 - [Instalação Rápida](#-instalação-rápida)
-- [As 14 Fases de Hardening](#-as-14-fases-de-hardening)
-- [Configuração Interativa](#-configuração-interativa)
+- [As 20 Fases de Hardening](#-as-20-fases-de-hardening)
+- [Componentes Opcionais](#-componentes-opcionais)
+- [Modo Cloudflare-Only](#-modo-cloudflare-only)
 - [Exemplos de Uso](#-exemplos-de-uso)
 - [Providers Testados](#-providers-testados)
 - [Troubleshooting](#-troubleshooting)
 - [FAQ](#-faq)
-- [Roadmap](#-roadmap)
 - [Contribuindo](#-contribuindo)
 - [Licença](#-licença)
 - [Contato](#-contato)
 
 ---
 
+## 🏗️ Arquitetura de Segurança
+
+```
+Internet
+    │
+    ▼
+┌─────────────────────────────────┐
+│         Cloudflare              │  • DDoS protection
+│   (proxy + WAF + CDN)           │  • Bot mitigation
+│                                 │  • TLS termination
+└──────────────┬──────────────────┘
+               │ HTTPS (apenas IPs Cloudflare)
+               ▼
+┌─────────────────────────────────┐
+│          UFW Firewall           │  • 80/443: apenas IPs Cloudflare
+│       (porta 80 e 443)          │  • Resto: apenas via Tailscale
+│                                 │  • Logging medium
+└──────────────┬──────────────────┘
+               │
+               ▼
+┌─────────────────────────────────┐
+│         Kernel Linux            │  • Conntrack (1M conexões)
+│    (network hardening)          │  • SYN cookies + tcp_rfc1337
+│                                 │  • ICMP rate limit
+└──────────────┬──────────────────┘
+               │
+               ▼
+┌─────────────────────────────────┐
+│    CrowdSec + Fail2Ban          │  • CrowdSec: HTTP/bots/scanners
+│    (IDS/IPS)                    │  • Fail2Ban: SSH brute force
+└──────────────┬──────────────────┘
+               │
+               ▼
+┌─────────────────────────────────┐
+│       Suas Aplicações           │  • Docker containers
+│    (Docker + Traefik)           │  • Portainer / Coolify
+└─────────────────────────────────┘
+
+Admin Access:
+    Tailscale VPN → SSH (porta customizada, apenas IP Tailscale)
+    Tailscale VPN → Netdata :19999 (monitoramento)
+```
+
+---
+
 ## 🚀 Features
 
-### Segurança Core
-- ✅ **SSH via Tailscale VPN apenas** - Zero exposição pública
-- ✅ **Firewall UFW** - HTTP/HTTPS público, resto privado
-- ✅ **Fail2Ban** - Proteção contra brute-force
-- ✅ **Kernel Hardening** - ASLR, ptrace restrito, core dumps desabilitados
-- ✅ **Criptografia forte** - Ed25519, ChaCha20-Poly1305
+### Segurança — Rede e Kernel
+- ✅ **Modo Cloudflare-Only** — HTTP/HTTPS aceitos APENAS dos IPs da Cloudflare
+- ✅ **Cloudflare IP Updater** — Serviço semanal que atualiza ranges automaticamente
+- ✅ **UFW com IPv4 + IPv6** — Firewall com logging medium, política DENY por padrão
+- ✅ **Conntrack hardening** — Tabela de 1M conexões, timeouts reduzidos (anti-DDoS)
+- ✅ **SYN Flood protection** — SYN cookies, tcp_rfc1337, synack_retries=2
+- ✅ **Anti-spoofing** — Reverse Path Filter (compatível com Docker/Tailscale)
+- ✅ **ICMP Rate Limit** — Limita flood ICMP a 100 pacotes/4s
+- ✅ **Kernel Hardening** — ASLR, ptrace restrito, core dumps desabilitados
+
+### Segurança — Acesso
+- ✅ **SSH via Tailscale VPN apenas** — Zero exposição pública do SSH
+- ✅ **Fail2Ban** — Proteção brute-force (escopo: SSH via Tailscale)
+- ✅ **CrowdSec** — IPS colaborativo: bots, scanners, IPs maliciosos, Tor (escopo: HTTP)
+- ✅ **Bloqueio de módulos de kernel** — Desabilita dccp, sctp, rds, tipc e filesystems não usados
+- ✅ **Auditd** — Monitora acessos a arquivos críticos (otimizado, ~1% overhead)
+- ✅ **Criptografia forte** — Ed25519, ChaCha20-Poly1305, curve25519
 
 ### Performance
-- ⚡ **BBR Congestion Control** - 2-25x mais throughput
-- ⚡ **TCP Tuning** - Buffers 16MB, connection queue 4096
-- ⚡ **1M File Descriptors** - Suporta APIs de alto tráfego
+- ⚡ **BBR Congestion Control** — 2-25x mais throughput
+- ⚡ **TCP Tuning** — Buffers 16MB, connection queue 4096, TCP Fast Open
+- ⚡ **1M File Descriptors** — Suporta APIs de alto tráfego
+- ⚡ **SWAP configurável** — Criado e persistido automaticamente
+
+### Infraestrutura
+- 🐳 **Docker Engine** — Instalação via script oficial, usuário adicionado ao grupo
+- 📊 **Netdata** — Monitoramento completo: host + Docker + Traefik em 1 container, UI via Tailscale:19999
 
 ### Automação
-- 🔄 **Sistema de Checkpoint** - Pause e continue de onde parou
-- 📊 **Logging Completo** - Todos os comandos com timestamp
-- 📈 **Progress Bar Visual** - Acompanhe em tempo real
-- 🤝 **Configuração Interativa** - Guiado passo a passo
-
-### Opcionais Avançados
-- 🛡️ **Auditd** - Monitora acessos a arquivos críticos
-- 🛡️ **AppArmor** - Mandatory Access Control
-- 🛡️ **Unattended Upgrades** - Patches automáticos de segurança
-- 🛡️ **Logging Avançado** - Logrotate + journald otimizado
+- 🔄 **Sistema de Checkpoint** — Pause e continue de onde parou em caso de falha
+- 📊 **Logging Completo** — Todos os comandos com timestamp
+- 📈 **Progress Bar Visual** — Acompanhe o progresso em tempo real
+- 🤝 **Configuração Interativa** — Guiado passo a passo
 
 ---
 
@@ -66,6 +123,8 @@ Script automatizado de hardening para servidores Ubuntu VPS com **14 fases de se
 - **Empreendedores** sem time de DevOps dedicado
 - **Freelancers** mantendo múltiplos servidores
 - **Equipes pequenas** sem budget para ferramentas enterprise
+
+Especialmente útil para quem usa **Cloudflare + Docker + Traefik** e quer proteção em camadas desde o SO.
 
 ---
 
@@ -82,6 +141,10 @@ Script automatizado de hardening para servidores Ubuntu VPS com **14 fases de se
 - Par de chaves SSH (`ssh-keygen -t ed25519`)
 - Cliente Tailscale instalado
 
+### Se usar Modo Cloudflare-Only
+- Domínios com proxy Cloudflare ativo (nuvem laranja) — **obrigatório**
+- Sem proxy ativo, o site ficará inacessível
+
 ---
 
 ## ⚡ Instalação Rápida
@@ -96,12 +159,8 @@ ssh root@SEU_IP_PUBLICO
 ### 2. Baixar o Script
 
 ```bash
-# Clone o repositório
 git clone https://github.com/andreluizfaustino/devsecops-vps-startup.git
-cd devsecops-vps-startup
-
-# Ou baixe direto
-wget https://raw.githubusercontent.com/andreluizfaustino/devsecops-vps-startup/main/startup.sh
+cd devsecops-vps-startup/Ubuntu
 chmod +x startup.sh
 ```
 
@@ -115,7 +174,7 @@ ssh-keygen -t ed25519 -C "seu-email@example.com"
 
 # Copiar chave pública
 cat ~/.ssh/id_ed25519.pub
-# ou no macOS:
+# macOS:
 cat ~/.ssh/id_ed25519.pub | pbcopy
 ```
 
@@ -127,72 +186,78 @@ sudo bash startup.sh
 
 ### 5. Seguir o Assistente Interativo
 
-O script fará perguntas sobre:
+O script pedirá:
 - Usuário SSH (root/ubuntu/customizado)
 - Senha do usuário
 - Porta SSH (padrão: 2222)
 - Tamanho do SWAP (padrão: 2GB)
-- Chave SSH pública (cole aqui)
-- Componentes opcionais (Auditd, AppArmor, etc.)
+- Chave SSH pública
+- Componentes opcionais
 
 ### 6. Autenticar no Tailscale
 
-Durante a **Fase 9**, o script mostrará uma URL:
+Durante a **Fase 9**, o script exibirá uma URL:
 
 ```
 ⚠️  AÇÃO NECESSÁRIA: Autenticação Tailscale
 
-Abra este link no seu navegador:
+Abra este link no navegador:
 https://login.tailscale.com/a/xxxxxxxxxxxxxxxx
 ```
 
 1. Abra o link no navegador
-2. Faça login na sua conta Tailscale
+2. Faça login na conta Tailscale
 3. Autorize o dispositivo
 4. Pressione ENTER no terminal
 
-### 7. Conectar via SSH Seguro
-
-Após conclusão (~15-20 min), conecte via Tailscale:
+### 7. Acessar via SSH Seguro
 
 ```bash
-# No seu computador, conecte ao Tailscale
+# Conecte ao Tailscale no seu computador
 tailscale up
 
 # Acesse via IP Tailscale
 ssh ubuntu@100.64.x.x -p 2222
 ```
 
-✅ **Pronto!** Seu servidor está seguro e pronto para produção.
+✅ **Pronto!** Servidor seguro e pronto para produção.
 
 ---
 
-## 🔐 As 14 Fases de Hardening
+## 🔐 As 20 Fases de Hardening
+
+### Fases Obrigatórias
 
 | Fase | Nome | O Que Faz | Tempo |
 |------|------|-----------|-------|
-| **1** | Usuário SSH | Cria/configura usuário não-root | ~10s |
-| **2** | Timezone | Configura America/Sao_Paulo | ~5s |
-| **3** | System Update | `apt update && upgrade` completo | ~3-5min |
-| **4** | Unattended Upgrades* | Atualizações automáticas de segurança | ~2min |
+| **1** | Usuário SSH | Cria/configura usuário com sudo | ~10s |
+| **2** | Timezone | America/Sao_Paulo + NTP | ~5s |
+| **3** | System Update | `apt update && upgrade` + limpeza | ~3-5min |
 | **5** | Kernel Security | ASLR, ptrace, core dumps | ~10s |
-| **6** | Network Hardening | BBR, TCP tuning, 1M file descriptors | ~30s |
-| **7** | SWAP | Cria swapfile configurável | ~1-2min |
+| **6** | Network Hardening | SYN cookies, conntrack, BBR, rp_filter, ICMP rate limit, 1M fds | ~30s |
+| **7** | SWAP | Cria swapfile no tamanho configurado | ~1-2min |
 | **8** | Chave SSH | Configura authorized_keys | ~5s |
-| **9** | **Tailscale** | Instala e conecta VPN mesh | ~2-3min |
-| **10** | **SSH Hardening** | SSH escuta APENAS no IP Tailscale | ~30s |
-| **11** | Fail2Ban | Proteção brute-force | ~1min |
-| **12** | **UFW Firewall** | HTTP/HTTPS público, resto via Tailscale | ~30s |
-| **13** | Auditd* | Monitora arquivos críticos | ~2min |
-| **14** | AppArmor* | Mandatory Access Control | ~1min |
+| **9** | **Tailscale** | Instala e conecta VPN ⚠️ *ação manual* | ~2-3min |
+| **10** | **SSH Hardening** | SSH apenas no IP Tailscale, criptografia forte | ~30s |
+| **11** | Fail2Ban | Brute-force SSH | ~1min |
+| **12** | **UFW Firewall** | Logging medium, DENY padrão, regras Cloudflare ou público | ~30s |
 
-\* *Componentes opcionais*
+### Fases Opcionais
+
+| Fase | Nome | Padrão | O Que Faz | Tempo |
+|------|------|--------|-----------|-------|
+| **4** | Unattended Upgrades | **S** | Patches de segurança automáticos | ~2min |
+| **13** | Cloudflare IP Updater | *(auto se CF-Only=S)* | Timer semanal, atualiza ranges CF no UFW | ~30s |
+| **14** | CrowdSec | **S** | IPS colaborativo: bots, scanners, reputação | ~3min |
+| **15** | Kernel Modules | **S** | Bloqueia protocolos e filesystems não usados | ~5s |
+| **16** | Auditd | **S** | Monitora /etc/passwd, sudo, sshd_config | ~2min |
+| **17** | Logging Avançado | **S** | Logrotate + journald 500MB | ~5s |
+| **18** | Docker Engine | **S** | Instala via get.docker.com | ~3min |
+| **19** | Netdata | **S** *(se Docker=S)* | Monitoramento host + Docker + Traefik | ~2min |
 
 ---
 
 ## 🎛️ Configuração Interativa
-
-### Exemplo de Configuração
 
 ```
 ════════════════════════════════════════════════════════
@@ -200,96 +265,198 @@ ssh ubuntu@100.64.x.x -p 2222
 ════════════════════════════════════════════════════════
 
 ETAPA 1/5: Configurar usuário SSH
-Escolha qual usuário terá acesso SSH:
-  1) root (manterá acesso root com chave SSH)
-  2) ubuntu (criar/usar usuário ubuntu - recomendado) ✅
-  3) outro (especificar nome de usuário customizado)
-
+  1) root
+  2) ubuntu ✅ (recomendado)
+  3) outro
 Opção [1-3]: 2
 
 ETAPA 2/5: Definir senha para usuário ubuntu
 Digite a nova senha: ********
-Repita a senha: ********
 
-ETAPA 3/5: Configurar porta SSH
-Digite a porta SSH desejada [padrão: 2222]: 2222
+ETAPA 3/5: Configurar porta SSH [padrão: 2222]: 2222
 
-ETAPA 4/5: Configurar SWAP
-Digite o tamanho do SWAP em GB [padrão: 2]: 4
+ETAPA 4/5: Configurar SWAP em GB [padrão: 2]: 4
 
-ETAPA 5/5: Configurar autenticação SSH
-Cole sua chave pública SSH: ssh-ed25519 AAAAC3NzaC...
+ETAPA 5/5: Cole sua chave pública SSH: ssh-ed25519 AAAAC3Nz...
 
 ════════════════════════════════════════════════════════
   COMPONENTES OPCIONAIS DE SEGURANÇA
 ════════════════════════════════════════════════════════
 
-[1] Unattended Upgrades (atualizações automáticas)
-    Instalar? [S/n]: S
+[1] Unattended Upgrades    Instalar? [S/n]: S
+[2] Auditd                 Instalar? [S/n]: S
+[4] Logging Avançado       Instalar? [S/n]: S
+[5] Modo Cloudflare-Only   Ativar?   [S/n]: S
+[6] CrowdSec               Instalar? [S/n]: S
+[7] Bloqueio Módulos Kernel Instalar? [S/n]: S
+[8] Docker                 Instalar? [S/n]: S
+[8b] Netdata               Instalar? [S/n]: S
 
-[2] Auditd (monitoramento avançado)
-    Instalar? [S/n]: S
+Resumo:
+  ✅ Unattended Upgrades
+  ✅ Auditd
+  ✅ Logging Avançado
+  ✅ Modo Cloudflare-Only
+  ✅ CrowdSec
+  ✅ Bloqueio de Módulos de Kernel
+  ✅ Docker Engine
+  ✅ Netdata (monitoramento completo)
+```
 
-[3] AppArmor (controle de acesso obrigatório)
-    ⚠️  ATENÇÃO: Pode causar lentidão em alguns serviços
-    Instalar? [S/n]: n
+---
 
-[4] Logging Avançado (logrotate + journald)
-    Instalar? [S/n]: S
+## 🧩 Componentes Opcionais
+
+### [1] Unattended Upgrades
+Instala patches de segurança do Ubuntu automaticamente. Apenas updates de segurança — não atualiza pacotes que possam quebrar aplicações. Reboot manual necessário se o kernel for atualizado.
+
+### [2] Auditd
+Monitora e registra acessos a arquivos críticos:
+- `/etc/passwd`, `/etc/shadow` — alterações
+- `/etc/ssh/sshd_config` — alterações
+- `/usr/bin/sudo`, `/bin/su` — execuções
+
+Configurado com overhead mínimo (~1%). Logs em `/var/log/audit/`.
+
+### [4] Logging Avançado
+Configura rotação de logs e limita journald a 500MB para evitar disco cheio.
+
+### [5] Modo Cloudflare-Only ⭐
+Restringe as portas 80 e 443 exclusivamente aos ranges IPv4 e IPv6 oficiais da Cloudflare. Qualquer scanner, bot ou ataque direto ao IP público é dropado silenciosamente.
+
+**Requer:** todos os domínios com proxy Cloudflare ativo (nuvem laranja).
+
+Ranges aplicados: 15 IPv4 + 7 IPv6 (fonte: cloudflare.com/ips).
+
+### [5b] Cloudflare IP Updater *(ativado automaticamente com CF-Only)*
+Serviço systemd que executa semanalmente:
+1. Busca os ranges atuais em `cloudflare.com/ips-v4` e `cloudflare.com/ips-v6`
+2. Remove as regras antigas do UFW
+3. Adiciona os novos ranges
+
+```bash
+# Executar manualmente
+systemctl start cf-update-ufw.service
+
+# Ver log
+cat /var/log/cf-update-ufw.log
+
+# Próxima execução
+systemctl status cf-update-ufw.timer
+```
+
+### [6] CrowdSec
+IPS colaborativo de código aberto. Aprende com ataques em servidores do mundo inteiro.
+
+- **Bouncer iptables**: bloqueia IPs maliciosos em tempo real
+- **Collections**: linux, traefik, nginx
+- **Escopo distinto do Fail2Ban**: CrowdSec → HTTP/bots; Fail2Ban → SSH
+
+```bash
+cscli decisions list   # IPs bloqueados
+cscli alerts list      # Alertas recentes
+cscli metrics          # Estatísticas
+cscli hub update       # Atualizar threat intelligence
+```
+
+### [7] Bloqueio de Módulos de Kernel
+Desabilita módulos desnecessários em servidores (CIS Benchmark):
+- **Protocolos**: `dccp`, `sctp`, `rds`, `tipc`
+- **Filesystems**: `cramfs`, `freevxfs`, `jffs2`, `hfs`, `hfsplus`, `udf`
+
+### [8] Docker Engine
+Instala via `get.docker.com`, habilita serviço, adiciona usuário SSH ao grupo `docker`.
+
+### [8b] Netdata *(requer Docker)*
+Monitoramento completo em 1 container:
+
+| Cobertura | Como |
+|-----------|------|
+| Host (CPU, RAM, disco, rede, processos) | Via `/proc` e `/sys` |
+| Docker containers | Via `docker.sock` |
+| Traefik | Integração nativa automática |
+
+**Acesso:** `http://<IP_Tailscale>:19999` — protegido pelo UFW, apenas via Tailscale.
+
+```bash
+cd /opt/netdata
+docker compose ps
+docker compose logs
+docker compose restart
+```
+
+---
+
+## ☁️ Modo Cloudflare-Only
+
+### Como funciona
+
+```
+Usuário  → cloudflare.com → proxy CF → SEU_IP:80/443  ✅ permitido
+Atacante → SEU_IP:80/443                               ❌ UFW DROP
+Scanner  → SEU_IP:80/443                               ❌ UFW DROP
+```
+
+### Checklist antes de ativar
+
+- [ ] Todos os domínios com nuvem **laranja** (proxy ativo) na Cloudflare
+- [ ] Nenhum domínio com nuvem cinza (acesso direto ao IP)
+- [ ] Acesso ao servidor via Tailscale garantido
+
+### Manutenção automática dos IPs
+
+```bash
+# Ver última atualização
+cat /var/log/cf-update-ufw.log | tail -5
+
+# Forçar atualização agora
+sudo systemctl start cf-update-ufw.service
 ```
 
 ---
 
 ## 💡 Exemplos de Uso
 
-### Caso 1: Servidor para Docker + Coolify
+### VPS com Coolify
 
 ```bash
-# 1. Execute o script de hardening
+# 1. Execute o script (com Docker=S)
 sudo bash startup.sh
 
-# 2. Após conclusão, instale Docker
-curl -fsSL https://get.docker.com | sh
-
-# 3. Instale Coolify
+# 2. Instale Coolify (Docker já instalado)
 curl -fsSL https://cdn.coollabs.io/coolify/install.sh | bash
 
-# 4. Acesse Coolify via IP público na porta 8000
-# Firewall já permite acesso (se necessário, ajuste UFW)
+# 3. Acesse via Tailscale
+# http://<IP_Tailscale>:8000
 ```
 
-### Caso 2: API Node.js com PostgreSQL
+> O Coolify gerencia seu próprio Traefik — não instale Traefik separado.
+
+### VPS com Portainer
 
 ```bash
-# 1. Execute o script de hardening
+# 1. Execute o script (com Docker=S)
 sudo bash startup.sh
 
-# 2. PostgreSQL via Docker (acessível apenas via Tailscale)
-docker run -d --name postgres \
-  -e POSTGRES_PASSWORD=senhasegura \
-  -v postgres_data:/var/lib/postgresql/data \
-  -p 5432:5432 \
-  postgres:16-alpine
+# 2. Suba o Portainer
+docker volume create portainer_data
+docker run -d \
+  --name portainer --restart=always \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v portainer_data:/data \
+  -p 9000:9000 \
+  portainer/portainer-ce:latest
 
-# 3. API Node.js com Nginx + Certbot
-sudo apt install nginx certbot python3-certbot-nginx
-sudo certbot --nginx -d api.seudominio.com
+# 3. Acesse via Tailscale
+# http://<IP_Tailscale>:9000
 ```
 
-### Caso 3: Múltiplos Servidores
+### Múltiplos Servidores
 
 ```bash
-# Use o mesmo script em todas as VPS
-# Todas aparecerão na mesma rede Tailscale
-
-# VPS 1 - Produção
-ssh ubuntu@100.64.1.10 -p 2222
-
-# VPS 2 - Staging
-ssh ubuntu@100.64.1.11 -p 2222
-
-# VPS 3 - Testes
-ssh ubuntu@100.64.1.12 -p 2222
+# Todos na mesma rede Tailscale
+ssh ubuntu@100.64.1.10 -p 2222  # Produção
+ssh ubuntu@100.64.1.11 -p 2222  # Staging
 ```
 
 ---
@@ -311,215 +478,144 @@ ssh ubuntu@100.64.1.12 -p 2222
 
 ## 🔧 Troubleshooting
 
-### ❌ Problema: Perdi o acesso SSH!
+### ❌ Perdi o acesso SSH
 
-**Causa:** Você não conectou ao Tailscale antes de tentar acessar.
+```bash
+# Reconectar Tailscale localmente
+tailscale up
+tailscale status
+ssh ubuntu@100.64.x.x -p 2222
+```
 
-**Solução:**
-1. Conecte-se ao Tailscale no seu computador:
-   ```bash
-   tailscale up
-   ```
-2. Verifique se o servidor aparece:
-   ```bash
-   tailscale status
-   ```
-3. Tente SSH novamente usando o IP Tailscale:
-   ```bash
-   ssh ubuntu@100.64.x.x -p 2222
-   ```
-
-**Plano B:** Acesse via console web do provider.
+**Plano B:** Console web do provider → `sudo tailscale up`.
 
 ---
 
-### ❌ Problema: Tailscale não está conectado
+### ❌ Site inacessível após Cloudflare-Only
 
-**Verificar status:**
-```bash
-sudo tailscale status
-```
-
-**Se mostrar "Logged out":**
-```bash
-sudo tailscale up
-# Abra a URL gerada no navegador
-```
+Domínio com nuvem cinza (sem proxy). No painel Cloudflare, ative a nuvem **laranja** no DNS record. Aguarde ~1 min.
 
 ---
 
-### ❌ Problema: O script falhou na fase X
-
-**O sistema de checkpoint te protege!**
+### ❌ Script falhou na fase X
 
 ```bash
-# Execute novamente
 sudo bash startup.sh
-
-# Você verá:
-# "Checkpoint encontrado! 7 de 14 fases concluídas."
-# Opções:
-#   1) Continuar de onde parou  ← escolha essa
-#   2) Recomeçar do zero
-#   3) Sair
+# "Checkpoint encontrado! X de 20 fases concluídas."
+# Escolha: 1) Continuar de onde parou
 ```
 
 ---
 
-### ❌ Problema: Como ver os logs detalhados?
+### ❌ Como ver os logs?
 
 ```bash
-# Log completo da execução
-cat logs/startup-YYYYMMDD_HHMMSS.log
-
-# Apenas erros
-cat logs/startup-errors.log
-
-# Informações do servidor configurado
-cat /root/server-info.txt
+cat logs/startup-YYYYMMDD_HHMMSS.log   # Log completo
+cat logs/startup-errors.log             # Apenas erros
+cat /root/server-info.txt               # Resumo do servidor
+cat /var/log/cf-update-ufw.log          # Cloudflare IP Updater
 ```
 
 ---
 
-### ❌ Problema: Firewall bloqueou uma porta que preciso
+### ❌ Preciso abrir uma porta extra
 
-**Liberar porta temporariamente:**
 ```bash
 # Apenas via Tailscale (recomendado)
 sudo ufw allow in on tailscale0 to any port 3000
 
-# Ou público (use com cautela!)
+# Publicamente (use com cautela)
 sudo ufw allow 3000/tcp comment 'Minha aplicação'
+
+sudo ufw status numbered
 ```
 
 ---
 
-### ❌ Problema: Como restaurar configuração SSH anterior?
+### ❌ Restaurar SSH anterior
 
 ```bash
-# O script cria backups automáticos
-ls -la /etc/ssh/sshd_config.backup.*
-
-# Restaurar
+ls /etc/ssh/sshd_config.backup.*
 sudo cp /etc/ssh/sshd_config.backup.YYYYMMDD_HHMMSS /etc/ssh/sshd_config
 sudo systemctl restart sshd
 ```
 
 ---
 
+### ❌ Netdata não abre
+
+```bash
+docker ps | grep netdata
+cd /opt/netdata && docker compose logs
+docker compose restart
+# Acesso: http://<IP_Tailscale>:19999
+```
+
+---
+
 ## ❓ FAQ
 
-### P: Posso usar em Debian ao invés de Ubuntu?
+**P: Posso usar em Debian?**  
+R: O script foi projetado para Ubuntu. Pode funcionar em Debian com aviso.
 
-**R:** O script foi projetado para Ubuntu. Pode funcionar em Debian, mas não é garantido. Você verá um aviso na execução.
+**P: Preciso do Tailscale?**  
+R: Sim, é obrigatório. O SSH escuta apenas no IP Tailscale.
 
----
+**P: Ativo Cloudflare-Only sem ter domínios configurados?**  
+R: Não. Configure os domínios na Cloudflare com proxy ativo primeiro.
 
-### P: Preciso do Tailscale? Posso pular essa parte?
+**P: CrowdSec e Fail2Ban conflitam?**  
+R: Não. Escopos distintos: Fail2Ban → SSH; CrowdSec → HTTP/bots.
 
-**R:** Não. O Tailscale é essencial para a arquitetura de segurança do script. O SSH fica configurado para escutar **apenas** no IP do Tailscale. Sem ele, você perde acesso SSH.
+**P: Netdata fica exposto na internet?**  
+R: Não. Porta 19999 sem regra UFW pública — apenas Tailscale.
 
----
+**P: Posso rodar em servidor de produção?**  
+R: ⚠️ Não recomendado. Teste em staging primeiro. Sempre tenha acesso ao console web.
 
-### P: Posso mudar a porta SSH depois?
+**P: Como adicionar outro usuário SSH?**
 
-**R:** Sim. Edite `/etc/ssh/sshd_config`, mude a linha `Port XXXX` e reinicie: `sudo systemctl restart sshd`. Não esqueça de atualizar o Fail2Ban também em `/etc/fail2ban/jail.local`.
-
----
-
-### P: Como adicionar outro usuário com acesso SSH?
-
-**R:** 
 ```bash
-# Criar usuário
 sudo useradd -m -s /bin/bash -G sudo novoUsuario
 sudo passwd novoUsuario
-
-# Adicionar chave SSH
 sudo mkdir -p /home/novoUsuario/.ssh
-sudo nano /home/novoUsuario/.ssh/authorized_keys
-# Cole a chave pública
+echo "CHAVE_PUBLICA" | sudo tee /home/novoUsuario/.ssh/authorized_keys
 sudo chmod 700 /home/novoUsuario/.ssh
 sudo chmod 600 /home/novoUsuario/.ssh/authorized_keys
 sudo chown -R novoUsuario:novoUsuario /home/novoUsuario/.ssh
-
-# Adicionar ao AllowUsers no SSH
-sudo nano /etc/ssh/sshd_config
-# Altere linha: AllowUsers ubuntu novoUsuario
+# Adicionar ao AllowUsers no sshd_config
+sudo sed -i 's/^AllowUsers .*/& novoUsuario/' /etc/ssh/sshd_config
 sudo systemctl restart sshd
 ```
 
 ---
 
-### P: Quanto de RAM o script precisa?
-
-**R:** Mínimo 1GB, recomendado 2GB+. O script usa pouca memória, mas as atualizações do sistema (`apt upgrade`) podem precisar de mais RAM temporariamente.
-
----
-
-### P: Posso executar o script em um servidor já em produção?
-
-**R:** ⚠️ **Não recomendado.** O script faz mudanças profundas no sistema (SSH, firewall, kernel). Teste em uma VPS de staging primeiro. Se precisar rodar em produção, faça backup completo antes.
-
----
-
 ## 🤝 Contribuindo
 
-Contribuições são muito bem-vindas! Este é um projeto open-source mantido pela comunidade.
+1. Fork o repositório
+2. Crie uma branch: `git checkout -b feature/minha-feature`
+3. Commit: `git commit -m 'feat: descrição'`
+4. Push: `git push origin feature/minha-feature`
+5. Abra um Pull Request
 
-### Como Contribuir
-
-1. **Fork** o repositório
-2. Crie uma **branch** para sua feature:
-   ```bash
-   git checkout -b feature/minha-feature
-   ```
-3. **Commit** suas mudanças:
-   ```bash
-   git commit -m 'feat: adiciona suporte para Debian'
-   ```
-4. **Push** para a branch:
-   ```bash
-   git push origin feature/minha-feature
-   ```
-5. Abra um **Pull Request**
-
-### Diretrizes
-
-- ✅ Teste em VPS real antes de submeter PR
-- ✅ Mantenha compatibilidade com Ubuntu 22.04/24.04
-- ✅ Atualize README.md se adicionar features
-- ✅ Siga o estilo de código existente
-- ✅ Use mensagens de commit descritivas ([Conventional Commits](https://www.conventionalcommits.org/))
-
-### Tipos de Contribuição
-
-- 🐛 **Reportar bugs** - Abra uma issue descrevendo o problema
-- 💡 **Sugerir features** - Abra uma issue com a tag `enhancement`
-- 📖 **Melhorar documentação** - PRs para README, comentários no código
-- 🧪 **Testar em novos providers** - Reporte compatibilidade
-- 🌍 **Traduções** - Ajude a traduzir a documentação
+**Diretrizes:** Teste em VPS real · Mantenha compatibilidade Ubuntu 22.04/24.04 · [Conventional Commits](https://www.conventionalcommits.org/)
 
 ---
 
 ## 📜 Licença
 
-Este projeto está licenciado sob a **MIT License** - veja o arquivo [LICENSE](LICENSE) para detalhes.
-
-**TL;DR:** Você pode usar, copiar, modificar e distribuir este software livremente, inclusive para fins comerciais, desde que mantenha o aviso de copyright.
+**MIT License** — use, copie, modifique e distribua livremente, inclusive para fins comerciais.
 
 ---
 
 ## ⚠️ Aviso Importante
 
-Este script modifica configurações críticas do sistema operacional. 
+- ✅ Teste em VPS não-produção primeiro
+- ⚠️ Configuração incorreta pode bloquear acesso SSH
+- 📋 Tenha acesso ao console web do provider
+- 🚫 Fornecido "como está", sem garantias
 
-- ✅ **Recomendado:** Testar em VPS não-produção primeiro
-- ⚠️ **Risco:** Configuração incorreta pode bloquear acesso SSH
-- 📋 **Backup:** Sempre tenha acesso ao console web do provider
-- 🚫 **Sem Garantias:** Fornecido "como está", sem garantias de qualquer tipo
-
-**Use por sua conta e risco. Os autores não se responsabilizam por perda de acesso ou dados.**
+**Use por sua conta e risco.**
 
 ---
 
@@ -529,35 +625,9 @@ Este script modifica configurações críticas do sistema operacional.
 **GitHub:** [@andreluizfaustino](https://github.com/andreluizfaustino)  
 **Repositório:** [devsecops-vps-startup](https://github.com/andreluizfaustino/devsecops-vps-startup)
 
-### Suporte
-
-- 🐛 **Bugs:** Abra uma [issue](https://github.com/andreluizfaustino/devsecops-vps-startup/issues)
-- 💬 **Discussões:** Use as [Discussions](https://github.com/andreluizfaustino/devsecops-vps-startup/discussions)
-- 📧 **Email:** Para questões privadas apenas
+- 🐛 **Bugs:** [Issues](https://github.com/andreluizfaustino/devsecops-vps-startup/issues)
+- 💬 **Discussões:** [Discussions](https://github.com/andreluizfaustino/devsecops-vps-startup/discussions)
 
 ---
 
-## 🌟 Agradecimentos
-
-Este script é resultado de anos de experiência em DevOps e segurança, com contribuições da comunidade.
-
-**Agradecimentos especiais:**
-- Time do [Tailscale](https://tailscale.com/) pelo produto incrível
-- Comunidade [Ubuntu](https://ubuntu.com/) pela documentação
-- Todos os contribuidores e testadores
-
----
-
-## ⭐ Star History
-
-Se este projeto te ajudou, considere dar uma ⭐ no repositório!
-
-[![Star History Chart](https://api.star-history.com/svg?repos=andreluizfaustino/devsecops-vps-startup&type=Date)](https://star-history.com/#andreluizfaustino/devsecops-vps-startup&Date)
-
----
-
-**Made with ❤️ by developers, for developers**
-
----
-
-**Tags:** `ubuntu` `security` `hardening` `vps` `tailscale` `devops` `ssh` `firewall` `automation` `bash` `linux` `sysadmin` `devsecops`
+*Feito com 🛡️ para a comunidade DevSecOps brasileira.*
