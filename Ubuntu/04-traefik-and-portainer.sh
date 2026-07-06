@@ -207,16 +207,16 @@ log_success "traefik.yml gerado"
 # ────────────────────────────────────────────────────────
 # docker-compose.yml — Traefik
 # ────────────────────────────────────────────────────────
-cat > "${TRAEFIK_DIR}/docker-compose.yml" << 'TRAEFIK_COMPOSE'
+cat > "${TRAEFIK_DIR}/docker-compose.yml" << TRAEFIK_COMPOSE
 services:
   traefik:
     image: traefik:v3
     container_name: traefik
     restart: unless-stopped
     ports:
-      - "80:80"
-      - "443:443"
-      - "8080:8080"    # Dashboard — protegido pelo UFW (só Tailscale acessa)
+      - "0.0.0.0:80:80"             # Público — Cloudflare encaminha para cá
+      - "0.0.0.0:443:443"           # Público — Cloudflare encaminha para cá
+      - "${TAILSCALE_IP}:8080:8080"  # Dashboard — só via Tailscale (evita bypass UFW)
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./traefik.yml:/etc/traefik/traefik.yml:ro
@@ -258,15 +258,15 @@ log_phase "Etapa 3/3: Portainer CE"
 PORTAINER_DIR="/opt/portainer"
 mkdir -p "${PORTAINER_DIR}"
 
-cat > "${PORTAINER_DIR}/docker-compose.yml" << 'PORTAINER_COMPOSE'
+cat > "${PORTAINER_DIR}/docker-compose.yml" << PORTAINER_COMPOSE
 services:
   portainer:
     image: portainer/portainer-ce:latest
     container_name: portainer
     restart: unless-stopped
     ports:
-      - "9000:9000"    # UI — protegido pelo UFW (só Tailscale acessa)
-      - "9443:9443"    # UI HTTPS (opcional)
+      - "${TAILSCALE_IP}:9000:9000"   # Só via Tailscale (evita bypass UFW pelo Docker)
+      - "${TAILSCALE_IP}:9443:9443"   # Só via Tailscale
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - portainer_data:/data

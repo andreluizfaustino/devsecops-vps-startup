@@ -89,6 +89,35 @@ else
     fi
 fi
 
+# Configurar daemon.json — regra master de segurança do Docker
+# Faz todos os containers bindarem em 127.0.0.1 por padrão (não expoem portas externamente)
+# Serviços públicos (Traefik) e Tailscale devem declarar bind explícito no docker-compose
+log_info "Configurando daemon.json (bind padrão = 127.0.0.1)..."
+
+cat > /etc/docker/daemon.json << 'DAEMON_JSON'
+{
+  "ip": "127.0.0.1",
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
+}
+DAEMON_JSON
+
+systemctl restart docker
+sleep 3
+
+if docker info &>/dev/null; then
+    log_success "daemon.json aplicado — bind padrão: 127.0.0.1"
+    log_info    "  • Containers sem bind explícito: só acessíveis via localhost"
+    log_info    "  • Traefik (80/443): bind explícito para 0.0.0.0 (público)"
+    log_info    "  • Portainer/dashboards: bind explícito para IP Tailscale"
+else
+    log_error "Docker não respondeu após aplicar daemon.json"
+    exit 1
+fi
+
 # ════════════════════════════════════════════════════════
 # ETAPA 2: NETDATA
 # ════════════════════════════════════════════════════════
