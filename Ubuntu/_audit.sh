@@ -416,7 +416,7 @@ check_docker() {
     section "Docker"
 
     if ! command -v docker &>/dev/null; then
-        log_result WARN "Docker instalado" "(não encontrado — opcional)"
+        log_result WARN "Docker instalado" "(não encontrado — execute: bash 02-docker.sh)"
         return
     fi
     log_result PASS "Docker instalado"
@@ -429,6 +429,15 @@ check_docker() {
         log_result FAIL "Docker serviço ativo" "(serviço parado)"
     fi
 
+    # daemon.json — bind padrão em 127.0.0.1
+    local daemon_ip
+    daemon_ip=$(python3 -c "import json; d=json.load(open('/etc/docker/daemon.json')); print(d.get('ip',''))" 2>/dev/null || echo "")
+    if [ "$daemon_ip" = "127.0.0.1" ]; then
+        log_result PASS "daemon.json bind = 127.0.0.1" "(containers sem bind explícito não expoem portas)"
+    else
+        log_result FAIL "daemon.json bind = 127.0.0.1" "(atual: '${daemon_ip:-não configurado}' — execute: bash 02-docker.sh)"
+    fi
+
     # Porta Docker NÃO exposta publicamente (2375/2376)
     if ss -tlnp 2>/dev/null | grep -q ":2375\|:2376"; then
         log_result FAIL "Docker API não exposta" "(porta 2375/2376 aberta — risco crítico!)"
@@ -437,38 +446,68 @@ check_docker() {
     fi
 }
 
+check_docker_user_firewall() {
+    section "DOCKER-USER Firewall"
+
+    # Serviço systemd
+    if systemctl is-enabled docker-user-firewall.service &>/dev/null 2>&1; then
+        log_result PASS "docker-user-firewall.service habilitado no boot"
+    else
+        log_result FAIL "docker-user-firewall.service habilitado" "(execute: bash 02-docker.sh)"
+    fi
+
+    if systemctl is-active --quiet docker-user-firewall.service 2>/dev/null; then
+        log_result PASS "docker-user-firewall.service ativo"
+    else
+        log_result FAIL "docker-user-firewall.service ativo" "(execute: systemctl start docker-user-firewall.service)"
+    fi
+
+    # Chain DOCKER-USER existe e tem regras
+    if iptables -L DOCKER-USER -n &>/dev/null 2>&1; then
+        local rule_count
+        rule_count=$(iptables -L DOCKER-USER -n 2>/dev/null | grep -c "^ACCEPT\|^DROP\|^RETURN" || echo 0)
+        if [ "${rule_count:-0}" -ge 5 ]; then
+            log_result PASS "Chain DOCKER-USER com regras" "(${rule_count} regras)"
+        else
+            log_result FAIL "Chain DOCKER-USER" "(menos de 5 regras — esperado mínimo 5)"
+        fi
+    else
+        log_result FAIL "Chain DOCKER-USER" "(chain não existe — Docker iniciado?)"
+    fi
+
+    # Cloudflare-Only: verifica se DOCKER-USER tem regras com source IP específico
+    # Format de iptables -L sem -v: target prot opt source destination [extra]
+    # source está na coluna 4 — se for 0.0.0.0/0 é regra genérica, se for IP específico é Cloudflare
+    local cf_with_src
+    cf_with_src=$(iptables -L DOCKER-USER -n 2>/dev/null | \
+        awk 'NR>2 && /tcp/ && /dpt:80|dpt:443/ && $4 != "0.0.0.0/0" {count++} END {print count+0}' 2>/dev/null || echo 0)
+    cf_with_src=$(echo "$cf_with_src" | tr -d ' ')
+
+    local cf_in_docker
+    cf_in_docker=$(iptables -L DOCKER-USER -n 2>/dev/null | grep -c "dpt:80\|dpt:443" 2>/dev/null || echo 0)
+    cf_in_docker=$(echo "$cf_in_docker" | tr -d ' ')
+
+    if [ "${cf_with_src:-0}" -gt 0 ] 2>/dev/null; then
+        log_result PASS "DOCKER-USER modo Cloudflare-Only" "(${cf_with_src} regras com source IP específico)"
+    elif [ "${cf_in_docker:-0}" -gt 0 ] 2>/dev/null; then
+        log_result WARN "DOCKER-USER modo Cloudflare-Only" "(80/443 abertos para todos — execute: bash 03-cloudflare-update-ufw.sh)"
+    else
+        log_result WARN "DOCKER-USER 80/443" "(nenhuma regra de porta encontrada)"
+    fi
+
+    # Timer de atualização mensal (opcional)
+    if systemctl is-enabled cloudflare-update-firewall.timer &>/dev/null 2>&1; then
+        local next_run
+        next_run=$(systemctl list-timers cloudflare-update-firewall.timer --no-pager 2>/dev/null | awk 'NR==2{print $1, $2}' || echo "desconhecido")
+        log_result PASS "Timer mensal Cloudflare ativo" "(próxima: ${next_run})"
+    else
+        log_result WARN "Timer mensal Cloudflare" "(não configurado — execute: bash 03-cloudflare-update-ufw.sh)"
+    fi
+}
+
 check_netdata() {
-    section "Netdata (Monitoramento)"
-
-    if ! command -v docker &>/dev/null; then
-        log_result WARN "Netdata" "(Docker não instalado — pulando)"
-        return
-    fi
-
-    if docker ps 2>/dev/null | grep -q "netdata"; then
-        local uptime
-        uptime=$(docker inspect netdata --format '{{.State.StartedAt}}' 2>/dev/null | cut -c1-19 || echo "desconhecido")
-        log_result PASS "Container Netdata rodando" "(iniciado: ${uptime})"
-    elif docker ps -a 2>/dev/null | grep -q "netdata"; then
-        log_result FAIL "Container Netdata" "(existe mas está parado — execute: cd /opt/netdata && docker compose up -d)"
-    else
-        log_result WARN "Container Netdata" "(não encontrado — opcional)"
-        return
-    fi
-
-    # Porta 19999 NÃO deve estar pública (UFW deve bloquear)
-    local ts_ip
-    ts_ip=$(tailscale ip -4 2>/dev/null | head -1)
-    if [ -n "$ts_ip" ]; then
-        log_result PASS "Netdata acessível via Tailscale" "(http://${ts_ip}:19999)"
-    fi
-
-    # Verificar se docker-compose.yml existe
-    if [ -f /opt/netdata/docker-compose.yml ]; then
-        log_result PASS "Netdata compose file" "(/opt/netdata/docker-compose.yml)"
-    else
-        log_result WARN "Netdata compose file" "(não encontrado em /opt/netdata/)"
-    fi
+    # Netdata removido do projeto — função mantida como stub para compatibilidade
+    : # no-op
 }
 
 check_logging() {
@@ -533,8 +572,15 @@ check_security_exposure() {
 
             # Porta em 0.0.0.0 ou IP público = potencialmente exposta
             if [ "$ip_part" = "0.0.0.0" ] || [ "$ip_part" = "*" ] || [ "$ip_part" = "$public_ip_check" ]; then
-                log_result WARN "Porta exposta publicamente" "($addr — verifique se UFW bloqueia)"
-                found_unexpected=1
+                # Verificar se é gerenciada pelo docker-proxy (protegida pelo DOCKER-USER, não UFW)
+                local proc
+                proc=$(ss -tlnp 2>/dev/null | awk -v addr=":${port_num}" '$4 ~ addr {print $NF}' | head -1)
+                if echo "$proc" | grep -q "docker-proxy"; then
+                    log_result PASS "Porta Docker (docker-proxy)" "($addr — protegida pelo DOCKER-USER)"
+                else
+                    log_result WARN "Porta exposta publicamente" "($addr — verifique se UFW bloqueia)"
+                    found_unexpected=1
+                fi
             fi
         done <<< "$exposed_ports"
     fi
@@ -640,7 +686,7 @@ main() {
     check_fail2ban
     check_auditd
     check_docker
-    check_netdata
+    check_docker_user_firewall
     check_logging
     check_security_exposure
 

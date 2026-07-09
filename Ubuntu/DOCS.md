@@ -9,10 +9,10 @@
 
 - [Visão Geral da Arquitetura](#visão-geral-da-arquitetura)
 - [01-startup.sh — Hardening do Servidor](#01-startupsh--hardening-do-servidor)
-- [02-docker-and-netdata.sh — Docker e Monitoramento](#02-docker-and-netdatash--docker-e-monitoramento)
+- [02-docker.sh — Docker + DOCKER-USER Firewall](#02-dockersh--docker--docker-user-firewall)
 - [03-cloudflare-update-ufw.sh — Cloudflare IP Updater](#03-cloudflare-update-ufwsh--cloudflare-ip-updater)
-- [04-traefik-and-portainer.sh — Traefik + Portainer](#04-traefik-and-portainersh--traefik--portainer)
-- [\_audit.sh — Auditoria de Saúde](#_auditsh--auditoria-de-saúde)
+- [_audit.sh — Auditoria de Saúde](#_auditsh--auditoria-de-saúde)
+- [Serviços systemd](#serviços-systemd)
 - [Arquivos Gerados](#arquivos-gerados)
 - [Fluxo de Execução Recomendado](#fluxo-de-execução-recomendado)
 
@@ -23,15 +23,20 @@
 ```
 Internet
     │
-    ├── IP público (ex: SEU_IP_PUBLICO)
-    │       ├── porta 80/443 → só IPs Cloudflare ✅
-    │       └── qualquer outra porta → DROP ❌
+    ├── Qualquer IP direto
+    │       ├── porta 80/443 → DOCKER-USER: ACCEPT só IPs Cloudflare ✅
+    │       ├── qualquer outra porta → DOCKER-USER: DROP ❌
+    │       └── SSH, painéis, DBs → UFW: DENY ❌
     │
-    └── Tailscale VPN (ex: 100.x.x.x)
-            └── tudo → ALLOW ✅ (admin e dispositivos autorizados)
+    └── Tailscale VPN (100.x.x.x)
+            └── tudo → ACCEPT ✅ (admin e dispositivos autorizados)
 
 Camadas de proteção (de fora para dentro):
-  Cloudflare WAF → UFW Firewall → Traefik (reverse proxy) → Fail2Ban (SSH) → Aplicação
+  Cloudflare WAF → UFW (INPUT) → DOCKER-USER (FORWARD) → Fail2Ban → Aplicação
+
+Por que duas camadas de firewall?
+  UFW (INPUT)        → protege o HOST (SSH, serviços nativos)
+  DOCKER-USER (FORWARD) → protege CONTAINERS (Docker bypassa UFW por padrão)
 ```
 
 ---
@@ -53,508 +58,177 @@ sudo bash 01-startup.sh
 ### Infraestrutura do Script
 
 #### Sistema de Checkpoint
-Antes de executar qualquer fase, verifica o arquivo `.startup-checkpoint`. Se interrompido (queda de conexão, erro, Ctrl+C), ao ser executado novamente oferece:
+Antes de executar qualquer fase, verifica o arquivo `.startup-checkpoint`. Se interrompido, ao executar novamente oferece:
 - **Continuar de onde parou** — refaz apenas as fases pendentes
 - **Recomeçar do zero** — apaga checkpoint e reinicia
 - **Sair**
 
-Cada fase é registrada no checkpoint imediatamente após conclusão.
-
 #### Sistema de Logging
-Todos os comandos são gravados em tempo real:
 - `logs/startup-YYYYMMDD_HHMMSS.log` — log completo com timestamps
 - `logs/startup-errors.log` — apenas erros
 
-#### Progress Bar
-Após cada fase, exibe visualmente o progresso:
-```
-Progresso: [████████████████░░░░░░░░] 50% (8/16 fases)
-```
-
 #### Configuração Salva
-Todas as respostas são salvas em `.startup-config` (permissão 600). Se o checkpoint existir, o arquivo é carregado automaticamente sem perguntar novamente.
+Respostas salvas em `.startup-config` (permissão 600). Recarregadas automaticamente em retomadas.
 
 ---
 
 ### Configuração Interativa
 
-Executada **antes** de qualquer fase. Coleta 5 informações obrigatórias e 5 opcionais.
+**Informações Obrigatórias:**
+1. **Usuário SSH** — `root`, `ubuntu` ou customizado
+2. **Senha** — solicitada apenas se não for root
+3. **Porta SSH** — aceita 22 ou 1024-65535, padrão: `2222`
+4. **SWAP** — tamanho em GB, mínimo 1GB, padrão: `2`
+5. **Chave pública SSH** — conteúdo do `~/.ssh/id_ed25519.pub`
 
-#### Informações Obrigatórias
+**Componentes Opcionais:**
 
-**1. Usuário SSH**
-- `root` — mantém acesso root apenas com chave SSH
-- `ubuntu` — cria ou usa usuário ubuntu existente, adicionado ao grupo sudo
-- `customizado` — qualquer nome válido (letras minúsculas, números, `_`, `-`, máx. 32 chars)
-
-**2. Senha do usuário**
-Solicitada apenas se não for root. Confirmação dupla. Senha vazia rejeitada.
-
-**3. Porta SSH**
-Aceita porta `22` ou `1024-65535`. Padrão: `2222`.
-
-**4. Tamanho do SWAP**
-Em gigabytes. Mínimo: 1GB. Padrão: `2`.
-
-**5. Chave pública SSH**
-Cole o conteúdo do `~/.ssh/id_ed25519.pub`. Validação: deve começar com `ssh-rsa`, `ssh-ed25519` ou `ssh-ecdsa`.
-
-#### Componentes Opcionais
-
-| # | Componente | Padrão | Tempo estimado |
-|---|---|---|---|
-| [1] | Unattended Upgrades | S | ~2 min |
-| [2] | Auditd | S | ~2 min |
-| [4] | Logging Avançado | S | ~5s |
-| [7] | Bloqueio de Módulos de Kernel | S | ~5s |
+| # | Componente | Padrão |
+|---|---|---|
+| [1] | Unattended Upgrades | S |
+| [2] | Auditd | S |
+| [3] | Logging Avançado | S |
+| [4] | Bloqueio de Módulos de Kernel | S |
 
 ---
 
-### As 16 Fases
+### As 15 Fases
 
 #### FASE 1 — Configurar Usuário SSH
-**Checkpoint:** `ubuntu_password`
-
-- Se não for root: verifica se o usuário já existe
-  - Se não existir: cria com `useradd -m -s /bin/bash -G sudo`
-  - Se já existir: apenas atualiza a senha
-- Define a senha via `chpasswd`
-- Se for root: registra que nenhuma ação é necessária
-
----
+Cria ou usa usuário existente, define senha, adiciona ao grupo sudo.
 
 #### FASE 2 — Timezone
-**Checkpoint:** `timezone`
-
-- Define timezone para `America/Sao_Paulo` via `timedatectl set-timezone`
-- Habilita sincronização automática: `timedatectl set-ntp true`
-
----
+Define `America/Sao_Paulo`, habilita sincronização NTP.
 
 #### FASE 3 — Atualização do Sistema
-**Checkpoint:** `system_update`
-
-- Remove repositórios problemáticos conhecidos (ex: Monarx da Hostinger)
-- `apt update` — atualiza lista de pacotes (continua mesmo com erros)
-- `apt upgrade -y` com `--force-confdef --force-confold`
-- `apt autoremove` — remove dependências órfãs
-- `apt autoclean` — limpa cache de pacotes
-
----
+`apt update` + `apt upgrade` + autoremove + autoclean.
 
 #### FASE 4 — Unattended Upgrades *(opcional)*
-**Checkpoint:** `unattended_upgrades`
-
-- Instala `unattended-upgrades` e `apt-listchanges`
-- Configura `/etc/apt/apt.conf.d/50unattended-upgrades`:
-  - Aplica apenas `*-security` (não updates gerais)
-  - Remove dependências não utilizadas automaticamente
-  - **Reboot automático desabilitado** (decisão manual do admin)
-- Configura `/etc/apt/apt.conf.d/20auto-upgrades`:
-  - Atualiza lista diariamente
-  - Instala patches de segurança diariamente
-  - Limpa cache semanalmente
-
----
+Patches de segurança automáticos diários, sem reboot automático.
 
 #### FASE 5 — Segurança do Kernel
-**Checkpoint:** `kernel_security`
+ASLR máximo, ptrace restrito, core dumps desabilitados.
 
-Cria arquivos em `/etc/sysctl.d/`:
-
-| Arquivo | Parâmetro | Valor | Efeito |
-|---|---|---|---|
-| `60-aslr.conf` | `kernel.randomize_va_space` | 2 | ASLR máximo — randomiza endereços de memória, dificulta exploits |
-| `60-yama.conf` | `kernel.yama.ptrace_scope` | 1 | Restringe ptrace — impede processo de espionar outro sem ser pai direto |
-| `60-coredump.conf` | `fs.suid_dumpable` | 0 | Desabilita core dumps — impede senha/chaves em arquivos de crash |
-| `limits.conf` | `* hard core` | 0 | Desabilita core dumps a nível de usuário |
-
----
-
-#### FASE 6 — Hardening de Rede + Performance Tuning
-**Checkpoint:** `network_hardening`
-
-Cria `/etc/sysctl.d/60-net.conf` com os seguintes grupos de parâmetros:
-
-##### Segurança de Rede
-
-| Parâmetro | Valor | Efeito |
-|---|---|---|
-| `net.ipv4.ip_forward` | 0 | Desabilita roteamento entre interfaces |
-| `net.ipv4.conf.all.send_redirects` | 0 | Não envia ICMP redirects |
-| `net.ipv4.conf.default.send_redirects` | 0 | Idem para novas interfaces |
-| `net.ipv4.conf.all.accept_redirects` | 0 | Ignora ICMP redirects recebidos (IPv4) |
-| `net.ipv4.conf.default.accept_redirects` | 0 | Idem |
-| `net.ipv6.conf.all.accept_redirects` | 0 | Ignora ICMP redirects (IPv6) |
-| `net.ipv6.conf.default.accept_redirects` | 0 | Idem |
-| `net.ipv4.conf.all.rp_filter` | 1 | Reverse Path Filter — descarta pacotes com IP forjado (anti-spoofing) |
-| `net.ipv4.conf.default.rp_filter` | 1 | Idem para novas interfaces |
-| `net.ipv4.icmp_ignore_bogus_error_responses` | 1 | Ignora respostas ICMP inválidas/malformadas |
-| `net.ipv4.icmp_echo_ignore_broadcasts` | 1 | Não responde a pings de broadcast (anti-smurf) |
-| `net.ipv4.icmp_ratelimit` | 100 | Limita ICMP flood a 100 pacotes por 4 segundos |
-| `net.ipv4.tcp_syncookies` | 1 | SYN cookies — protege contra SYN flood sem descartar conexões legítimas |
-| `net.ipv4.tcp_rfc1337` | 1 | Proteção contra TIME-WAIT assassination (RFC 1337) |
-| `net.ipv4.tcp_timestamps` | 0 | Desabilita timestamps TCP — evita fingerprinting do uptime |
-| `net.ipv4.tcp_synack_retries` | 2 | Reduz tentativas de SYN-ACK — libera recursos mais rápido em ataques |
-
-##### Performance TCP
-
-| Parâmetro | Valor | Efeito |
-|---|---|---|
-| `net.core.somaxconn` | 4096 | Fila máxima de conexões TCP pendentes |
-| `net.ipv4.tcp_max_syn_backlog` | 8192 | Fila de SYN half-open connections |
-| `net.core.rmem_max` / `wmem_max` | 16MB | Buffers máximos de leitura/escrita |
-| `net.ipv4.tcp_rmem` / `tcp_wmem` | 4096/87380/16MB | Buffers adaptativos por socket |
-| `net.ipv4.tcp_tw_reuse` | 1 | Reutiliza sockets em TIME_WAIT |
-| `net.ipv4.tcp_fin_timeout` | 15s | Reduz tempo de espera para fechar conexão |
-| `net.ipv4.tcp_max_tw_buckets` | 400000 | Máximo de sockets em TIME_WAIT simultâneos |
-| `net.ipv4.tcp_fastopen` | 3 | TCP Fast Open — reduz latência da primeira conexão |
-| `net.ipv4.tcp_keepalive_time` | 600s | Inicia keepalive após 10 min de inatividade |
-| `net.ipv4.tcp_keepalive_intvl` | 10s | Intervalo entre probes |
-| `net.ipv4.tcp_keepalive_probes` | 6 | Probes antes de declarar conexão morta |
-
-##### File Descriptors
-
-| Parâmetro | Valor | Efeito |
-|---|---|---|
-| `fs.file-max` | 2.097.152 | Máximo global de file descriptors |
-| `fs.nr_open` | 2.097.152 | Máximo por processo |
-
-Configura também em `/etc/security/limits.conf` e `/etc/systemd/system.conf` com `DefaultLimitNOFILE=1048576`.
-
-##### BBR Congestion Control
-Verifica suporte com `modprobe tcp_bbr`. Se disponível:
-```
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-```
-BBR (Google) oferece 2-25x mais throughput que o CUBIC padrão em condições de perda de pacotes.
-
-##### Conntrack — Proteção Anti-DDoS por Flood de Conexões
-Garante carga do módulo no boot via `/etc/modules-load.d/nf_conntrack.conf`. Configura em `/etc/sysctl.d/60-conntrack.conf`:
-
-| Parâmetro | Valor | Efeito |
-|---|---|---|
-| `nf_conntrack_max` | 1.048.576 | Tabela suporta 1 milhão de conexões simultâneas |
-| `tcp_timeout_established` | 86400s | Conexões estabelecidas expiram em 24h |
-| `tcp_timeout_syn_recv` | 15s | Half-open connections expiram em 15s |
-| `tcp_timeout_time_wait` | 15s | TIME_WAIT libera slot em 15s |
-| `tcp_timeout_close_wait` | 30s | CLOSE_WAIT libera slot em 30s |
-
-> Sem essa configuração, um flood de conexões pode esgotar a tabela do conntrack e travar o servidor completamente.
-
----
+#### FASE 6 — Hardening de Rede + Performance
+| Grupo | Efeito |
+|---|---|
+| Anti-spoofing, anti-redirect, anti-smurf | Impede spoofing e ataques ICMP |
+| SYN cookies + tcp_rfc1337 | Proteção anti-SYN flood |
+| Conntrack 1M conexões | Suporta alta carga sem travar |
+| BBR congestion control | 2-25x mais throughput |
+| TCP tuning (buffers 16MB, somaxconn 4096) | APIs de alto tráfego |
+| File descriptors 1M | Conexões simultâneas |
 
 #### FASE 7 — SWAP
-**Checkpoint:** `swap`
-
-- Desativa e remove swap existente se houver
-- Cria `/swap/swapfile` com `dd` no tamanho configurado
-- `chmod 600` — permissão obrigatória
-- `mkswap` + `swapon` — formata e ativa
-- Adiciona entrada no `/etc/fstab` para persistência após reboot
-
----
+Cria `/swap/swapfile` com tamanho configurado, persiste no `/etc/fstab`.
 
 #### FASE 8 — Chave SSH
-**Checkpoint:** `ssh_key`
-
-- Cria `~/.ssh/` com `chmod 700`
-- Escreve chave pública em `~/.ssh/authorized_keys`
-- `chmod 600` no arquivo
-- `chown -R USUARIO:USUARIO` (se não for root)
-
----
+Instala chave pública em `~/.ssh/authorized_keys` com permissões corretas.
 
 #### FASE 9 — Tailscale VPN ⚠️ *requer ação manual*
-**Checkpoint:** `tailscale`
-
-- Instala via `https://tailscale.com/install.sh`
-- Executa `tailscale up` → exibe URL de autenticação
-- **Pausa** — admin abre URL no navegador e pressiona ENTER
-- Captura `TAILSCALE_IPV4` e `TAILSCALE_IPV6` via `tailscale ip`
-- Salva IPs no `.startup-config` para fases seguintes
-- Aborta se não conectar (fase 10 depende do IP Tailscale)
-
----
+Instala, executa `tailscale up`, pausa para autenticação no navegador, captura IPs.
 
 #### FASE 10 — SSH Hardening *(fase mais crítica)*
-**Checkpoint:** `ssh_config`
-
-SSH passa a escutar **apenas** nos IPs do Tailscale — invisível no IP público.
-
-**Desabilita cloud-init:**
-- `50-cloud-init.conf` → `.disabled`
-- `60-cloudimg-settings.conf` → `.disabled`
-
-**Remove configurações antigas** do `sshd_config` (linhas ativas e comentadas).
-
-**Cria backup:** `sshd_config.backup.YYYYMMDD_HHMMSS`
-
-**Aplica configuração segura:**
-```
-ListenAddress 127.0.0.1
-ListenAddress <TAILSCALE_IPV4>
-ListenAddress <TAILSCALE_IPV6>
-
-Port <SSH_PORT>
-Protocol 2
-
-PubkeyAuthentication yes
-PasswordAuthentication no
-ChallengeResponseAuthentication no
-PermitEmptyPasswords no
-PermitRootLogin no  (ou prohibit-password se usuário=root)
-AllowUsers <SSH_USER>
-
-LoginGraceTime 30
-MaxAuthTries 3
-MaxSessions 2
-MaxStartups 10:30:60
-
-ClientAliveInterval 300
-ClientAliveCountMax 2
-TCPKeepAlive no
-
-X11Forwarding no
-PermitUserEnvironment no
-GatewayPorts no
-PermitTunnel no
-
-# Algoritmos de criptografia modernos apenas
-KexAlgorithms curve25519-sha256,...
-Ciphers chacha20-poly1305,...
-MACs hmac-sha2-512-etm,...
-```
-
-**Validação com `sshd -t`** antes de reiniciar. **Rollback automático** se falhar.
-
----
+SSH passa a escutar **apenas** nos IPs do Tailscale:
+- Desabilita cloud-init overrides
+- Desabilita autenticação por senha
+- Habilita apenas chave pública
+- Algoritmos modernos: Ed25519, ChaCha20-Poly1305, curve25519
+- Validação com `sshd -t` e rollback automático se falhar
 
 #### FASE 11 — Fail2Ban
-**Checkpoint:** `fail2ban`
-
-Cria `/etc/fail2ban/jail.local` com dois jails:
-
-**[sshd]:**
-```
-maxretry = 3
-bantime = -1     (ban permanente)
-findtime = 600s
-```
-
-**[sshd-ddos]:**
-```
-maxretry = 5
-bantime = 3600s  (1 hora)
-```
-
-Escopo: `/var/log/auth.log` (tentativas de login SSH)
-
----
+Jails `sshd` (ban permanente após 3 tentativas) e `sshd-ddos` (1h após 5 tentativas). Escopo: `/var/log/auth.log`.
 
 #### FASE 12 — Firewall UFW
-**Checkpoint:** `firewall_ufw`
-
-- `IPV6=yes` em `/etc/default/ufw`
-- `ufw --force reset` — limpa regras existentes
-- Políticas: `DENY incoming`, `ALLOW outgoing`
-- Libera 80 e 443 publicamente (substituídos pela Cloudflare ao rodar `03-cloudflare-update-ufw.sh`)
+- Política padrão: DENY incoming, ALLOW outgoing
+- Libera 80 e 443 publicamente (substituídos por Cloudflare-Only ao rodar `03`)
 - Libera toda a interface `tailscale0`
-- `ufw --force enable`
-- `ufw logging medium` — loga pacotes bloqueados por regra e por política padrão
-
----
+- Logging medium
 
 #### FASE 13 — Bloqueio de Módulos de Kernel *(opcional)*
-**Checkpoint:** `kernel_modules`
-
-Cria `/etc/modprobe.d/blacklist-hardening.conf`:
-
-**Protocolos de rede bloqueados:**
-| Módulo | Protocolo | Motivo |
-|---|---|---|
-| `dccp` | Datagram Congestion Control | Nunca usado em servidores, histórico de CVEs |
-| `sctp` | Stream Control Transmission | Apenas telecomunicações |
-| `rds` | Reliable Datagram Sockets | Apenas clusters Oracle RAC |
-| `tipc` | Transparent Inter-Process Comm | Apenas clusters especializados |
-
-**Filesystems bloqueados:**
-| Módulo | Filesystem | Motivo |
-|---|---|---|
-| `cramfs` | Compressed ROM FS | Sistemas embarcados |
-| `freevxfs` | Veritas FS | UNIX legado |
-| `jffs2` | Journalling Flash FS | Dispositivos embarcados |
-| `hfs` | HFS Mac OS clássico | Nunca usado em servidores Linux |
-| `hfsplus` | HFS+ Mac OS X | Idem |
-| `udf` | Universal Disk Format | DVD/Blu-ray |
-
-`update-initramfs -u` garante aplicação no próximo boot. Segue recomendações CIS Benchmark.
-
----
+Bloqueia: `dccp`, `sctp`, `rds`, `tipc`, `cramfs`, `jffs2`, `hfs`, `hfsplus`, `udf`. Segue CIS Benchmark.
 
 #### FASE 14 — Auditd *(opcional)*
-**Checkpoint:** `auditd`
-
-Configura `/etc/audit/rules.d/hardening.rules` com **5 regras otimizadas** (~1% overhead):
-
-```
-# Alterações em arquivos críticos
--w /etc/passwd          -p wa -k passwd_changes
--w /etc/shadow          -p wa -k shadow_changes
--w /etc/ssh/sshd_config -p wa -k sshd_changes
-
-# Execução de comandos privilegiados
--w /usr/bin/sudo -p x -k sudo_execution
--w /bin/su       -p x -k su_execution
-```
-
-Configuração do `auditd.conf`:
-- `max_log_file = 50` MB por arquivo
-- `num_logs = 10` rotações
-- `max_log_file_action = rotate`
-
-Logs em `/var/log/audit/audit.log`.
-
-> Regras pesadas omitidas intencionalmente: monitoramento de `/home`, syscalls `execve`, mudanças de permissão — impacto de performance inaceitável para APIs.
-
----
+Monitora: `/etc/passwd`, `/etc/shadow`, `sshd_config`, `sudo`, `su`. Otimizado para ~1% overhead.
 
 #### FASE 15 — Logging Avançado *(opcional)*
-**Checkpoint:** `logging`
+Journald persistente (500MB máx), logrotate para sudo.log, rsyslog ativo.
 
-**Logrotate** — `/etc/logrotate.d/sudo`:
-```
-/var/log/sudo.log {
-    weekly / rotate 4 / compress / missingok / notifempty
-}
-```
-
-**Journald** — `/etc/systemd/journald.conf`:
-- `Storage=persistent` — persiste logs entre reboots
-- `SystemMaxUse=500M` — limita uso de disco a 500MB
+### Ao Final
+Resumo no terminal, `server-info.txt` em `/root/`, **reboot automático em 10s**.
 
 ---
 
-### Ao Final do Script
-
-**Resumo no terminal** com todos os valores configurados.
-
-**`/root/server-info.txt`** — arquivo com informações de acesso:
-- Comando SSH: `ssh USUARIO@IP_TAILSCALE -p PORTA`
-- IPs Tailscale (IPv4 e IPv6)
-- Status do firewall e componentes
-
-**Reboot automático em 10 segundos** — necessário para:
-- Módulos bloqueados não carregarem mais
-- `nf_conntrack` iniciar com valores corretos
-- File descriptor limits do systemd entrarem em efeito
-- Configurações do kernel serem consolidadas
-
----
-
-## 02-docker-and-netdata.sh — Docker e Monitoramento
+## 02-docker.sh — Docker + DOCKER-USER Firewall
 
 ### Visão Geral
 
-Instala Docker Engine e sobe o Netdata via Docker Compose com integrações para CrowdSec, Fail2Ban e UFW/iptables. Deve ser executado **após** o `01-startup.sh` e o reboot.
+Instala Docker Engine e configura o firewall `DOCKER-USER` para bloquear acesso direto a containers por IP, permitindo apenas Cloudflare (80/443) e Tailscale. Deve ser executado **após** o `01-startup.sh` e o reboot.
 
 ```bash
-sudo bash 02-docker-and-netdata.sh
+sudo bash 02-docker.sh
 ```
 
 ---
 
-### Etapa 1/4 — Docker
+### Por que DOCKER-USER?
 
-- Verifica se Docker já está instalado (`docker info`)
-  - Se já existir: exibe versão e pula a instalação
-  - Se não existir: instala via `curl -fsSL https://get.docker.com | sh`
-- Habilita e inicia o serviço `docker`
-- Adiciona o usuário `ubuntu` ao grupo `docker` (evita uso de sudo em cada comando)
-- Valida com `docker info`
+O Docker **bypassa o UFW** para tráfego de containers — ele injeta regras diretamente em `iptables FORWARD`. Isso significa que o UFW sozinho não protege containers. A chain `DOCKER-USER` é executada **antes** das regras do Docker no `FORWARD`, sendo o único ponto de controle confiável.
+
+```
+Internet → eth0 → FORWARD chain → DOCKER-USER (nosso controle) → DOCKER-FORWARD → container
+                                                                  ↑
+                                                        UFW não chega aqui
+```
 
 ---
 
-### Etapa 2/4 — Netdata
+### Etapa 1/3 — Docker Engine
 
-Cria `/opt/netdata/docker-compose.yml` e `/opt/netdata/config/` e sobe o container.
+- Pergunta se deseja instalar o Docker
+- Instala via repositório oficial apt:
+  - `docker-ce`, `docker-ce-cli`, `containerd.io`, `docker-buildx-plugin`, `docker-compose-plugin`
+- Habilita e inicia `docker.service`
+- Adiciona usuário `ubuntu` ao grupo docker (se existir)
+- Cria `/etc/docker/daemon.json`:
 
-**Configuração do container:**
-```yaml
-image: netdata/netdata:latest
-network_mode: host       # acesso direto às interfaces do host
-pid: host                # acesso aos processos do host
-cap_add:
-  - SYS_PTRACE           # leitura de processos
-  - SYS_ADMIN            # acesso a subsistemas do kernel
-  - NET_ADMIN            # acesso a regras de rede (iptables)
-security_opt:
-  - apparmor:unconfined
+```json
+{
+  "ip": "127.0.0.1",
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "3" }
+}
 ```
 
-**Volumes montados:**
-| Volume | Propósito |
-|---|---|
-| `./config:/etc/netdata` | Configurações persistentes (bind mount) |
-| `/proc:/host/proc:ro` | Métricas do host (CPU, RAM, processos) |
-| `/sys:/host/sys:ro` | Métricas de hardware |
-| `/:/host/root:ro` | Acesso ao sistema de arquivos do host |
-| `/var/run/docker.sock:ro` | Métricas de containers Docker |
-| `/var/run/fail2ban/fail2ban.sock:ro` | Integração Fail2Ban |
-
-**Cobertura nativa automática:**
-- Host: CPU, RAM, disco, rede, processos, file descriptors
-- Docker: CPU, RAM, I/O por container
-- Tailscale: tráfego da interface `tailscale0`
-- Conntrack: uso da tabela de conexões (configurada para 1M)
-- Systemd: status dos serviços (fail2ban, crowdsec, auditd, tailscaled)
-
-**Acesso:** `http://<IP_TAILSCALE>:19999` — porta protegida pelo UFW, só acessível via Tailscale.
+`"ip": "127.0.0.1"` faz containers sem bind explícito bindarem em localhost — não ficam expostos. Complementa o DOCKER-USER para containers com bind `0.0.0.0` (como Traefik).
 
 ---
 
-### Etapa 3/4 — Integração CrowdSec
+### Etapa 2/3 — Script DOCKER-USER
 
-Se o CrowdSec estiver instalado:
-1. Remove bouncer antigo `netdata-bouncer` se existir
-2. Cria novo bouncer: `cscli bouncers add netdata-bouncer -o raw`
-3. Cria `/opt/netdata/config/go.d/crowdsec.conf`:
-```yaml
-jobs:
-  - name: local
-    url: http://localhost:8080
-    credentials:
-      api_key: <API_KEY_GERADA>
+Cria `/usr/local/bin/docker-user-firewall.sh` com a lógica de firewall:
+
+```bash
+# Regras aplicadas (em ordem):
+1. ESTABLISHED,RELATED → ACCEPT    # respostas a conexões iniciadas por você
+2. tailscale0 → ACCEPT             # tudo via Tailscale VPN
+3. IPs Cloudflare :80 → ACCEPT     # lidos do UFW (se 03 já rodou)
+   IPs Cloudflare :443 → ACCEPT    # fallback: abre para todos se UFW sem CF
+4. eth0 → DROP                     # bloqueia todo o resto da internet
+5. RETURN                          # tráfego interno entre containers: normal
 ```
-4. Reinicia o container para aplicar
 
-**Métricas disponíveis via Prometheus** (autodiscovery na porta 6060):
-- `cs_filesource` — linhas de log lidas por segundo
-- `cs_lapi` — requests à API local (bouncers e máquinas)
-- `cs_parser` — parsing de logs
-- `cs_decisions` — decisões ativas (bans)
+**Lógica de IPs Cloudflare:**
+O script lê os IPs diretamente do que o UFW já tem registrado (comentário `Cloudflare`). Não faz requisições à internet no boot. Se `03` ainda não rodou, o UFW não tem IPs Cloudflare → fallback abre 80/443 para todos temporariamente.
 
 ---
 
-### Etapa 4/4 — Integração UFW/iptables + Fail2Ban
+### Etapa 3/3 — Serviço systemd
 
-**UFW/iptables** — cria `/opt/netdata/config/go.d/iptables.conf`:
-```yaml
-jobs:
-  - name: filter
-    tables:
-      - name: filter
-        chains: [INPUT, FORWARD, OUTPUT]
-```
-> Nota: Ubuntu 22.04+ usa nftables como backend. O Conntrack em `Network > Firewall > Conntrack` mostra conexões ativas. Para DROPs do UFW seria necessário exportar logs do UFW via log parser.
-
-**Fail2Ban** — cria `/opt/netdata/config/go.d/fail2ban.conf`:
-```yaml
-jobs:
-  - name: local
-    socket: /var/run/fail2ban/fail2ban.sock
-```
+Cria e habilita `docker-user-firewall.service`:
+- `After=docker.service` → executa após Docker iniciar
+- `Type=oneshot` + `RemainAfterExit=yes` → roda uma vez, permanece "ativo"
+- Garante que as regras sejam reaplicadas em todo reboot
 
 ---
 
@@ -562,7 +236,7 @@ jobs:
 
 ### Visão Geral
 
-Script de manutenção que sincroniza as regras do UFW com os ranges de IPs mais recentes da Cloudflare. Deve ser executado **manualmente** pelo administrador sempre que quiser atualizar ou na primeira vez após o `01-startup.sh`.
+Atualiza os IPs da Cloudflare no UFW e no DOCKER-USER, ativando o modo Cloudflare-Only. Após a primeira execução, acesso direto por IP às portas 80/443 é bloqueado no nível de rede.
 
 ```bash
 sudo bash 03-cloudflare-update-ufw.sh
@@ -572,155 +246,58 @@ sudo bash 03-cloudflare-update-ufw.sh
 
 ### Funcionamento
 
-**1. Busca IPs atuais da Cloudflare:**
+**1. Pergunta inicial** — confirma se deseja verificar/atualizar IPs.
+
+**2. Busca IPs oficiais da Cloudflare:**
 ```
-https://www.cloudflare.com/ips-v4  (15 ranges IPv4)
-https://www.cloudflare.com/ips-v6  (7 ranges IPv6)
-```
-
-**2. Lê regras Cloudflare atuais do UFW** — extrai IPs de regras com comentário `Cloudflare`.
-
-**3. Calcula o diff:**
-- IPs novos não presentes no UFW → lista para adicionar
-- IPs no UFW que não estão na lista nova → lista para remover
-
-**4. Exibe resumo detalhado** antes de qualquer ação:
-```
-IPs atualmente no UFW (Cloudflare): 44
-IPs na lista atual da Cloudflare:   46
-
-❌ IPs a REMOVER (1):
-   − 198.41.128.0/17
-
-✅ IPs a ADICIONAR (3):
-   + 103.21.244.0/22
-   ...
+https://www.cloudflare.com/ips-v4  → 15 ranges IPv4
+https://www.cloudflare.com/ips-v6  → 7 ranges IPv6
 ```
 
-**5. Pede confirmação** — só aplica após `s` explícito.
+**3. Lê regras Cloudflare atuais do UFW** — extrai IPs de regras com comentário `Cloudflare`.
 
-**6. Remove regras públicas** (`80/tcp ALLOW Anywhere`) — garante que somente Cloudflare acesse 80/443.
+**4. Calcula diff** — IPs a adicionar e IPs obsoletos a remover.
 
-**7. Remove IPs obsoletos** do UFW (de trás para frente para não deslocar índices).
+**5. Exibe resumo detalhado** antes de qualquer ação.
 
-**8. Adiciona novos IPs** com comentário `Cloudflare IPv4` ou `Cloudflare IPv6`.
+**6. Pede confirmação** — só aplica após `s` explícito.
 
-**9. Exibe resultado** com total de regras ativas.
+**7. Remove regras públicas** — garante que 80/443 só aceitem Cloudflare.
+
+**8. Remove IPs obsoletos** + **adiciona IPs novos** no UFW.
+
+**9. Atualiza DOCKER-USER** — reinicia `docker-user-firewall.service`, que lê os novos IPs do UFW e reaplicaca todas as regras.
+
+**10. Pergunta sobre timer mensal** — se ainda não existir, oferece criar atualização automática.
 
 ---
 
-### Quando rodar
+### Modo Cloudflare-Only: como funciona
 
-- **Primeira vez** após `01-startup.sh` — ativa o modo Cloudflare-Only
-- **Periodicamente** (recomendado mensal) — a Cloudflare ocasionalmente adiciona/remove ranges
-- **Quando o audit mostrar** mudança no número de regras esperadas
+Após rodar o `03`, qualquer acesso que **não venha de um IP Cloudflare** é dropado no `DOCKER-USER` antes de chegar nos containers:
 
----
-
-## 04-traefik-and-portainer.sh — Traefik + Portainer
-
-### Visão Geral
-
-Instala **Traefik v3** como reverse proxy com SSL automático via Let's Encrypt e **Portainer CE** para gerenciamento visual de containers Docker. Deve ser executado após `02-docker-and-netdata.sh` e `03-cloudflare-update-ufw.sh`.
-
-```bash
-sudo bash 04-traefik-and-portainer.sh
-```
+| Origem | Porta | Resultado |
+|---|---|---|
+| IP Cloudflare | 80 ou 443 | ACCEPT → chega no Traefik |
+| IP qualquer direto | 80 ou 443 | DROP no DOCKER-USER |
+| IP qualquer direto | qualquer outra | DROP no DOCKER-USER |
+| Tailscale VPN | qualquer | ACCEPT → acesso total |
 
 ---
 
-### Configuração Interativa
+### Timer Mensal Automático (opcional)
 
-Solicita apenas o **email para o Let's Encrypt** (usado para notificações de expiração).
+Ao final da execução, o script oferece criar:
 
----
-
-### Etapa 1 — Rede Docker Compartilhada
-
-Cria a rede Docker `traefik_public`. Todos os serviços que precisam ser expostos via Traefik devem usar esta rede.
-
-```bash
-docker network create traefik_public
-```
-
-Se a rede já existir, pula sem erro.
-
----
-
-### Etapa 2 — Traefik v3
-
-**Diretório:** `/opt/traefik/`
-
-**`traefik.yml` — configuração estática:**
-
-| Componente | Configuração |
+| Arquivo | Função |
 |---|---|
-| Entry point `web` (80) | Redireciona tudo para HTTPS (301 permanente) |
-| Entry point `websecure` (443) | TLS + forwardedHeaders com IPs Cloudflare como trusted proxies |
-| Let's Encrypt | HTTP-01 challenge via Cloudflare proxy, email configurado interativamente |
-| Docker provider | `exposedByDefault: false` — só containers com `traefik.enable=true` são expostos |
-| File provider | Lê configs dinâmicas de `/opt/traefik/dynamic/` |
-| Dashboard | Porta 8080, `insecure: true` (seguro via UFW — só Tailscale acessa) |
-| Logs | Access log com IP real do visitante (`CF-Connecting-IP`, `X-Forwarded-For`) |
+| `/usr/local/bin/cloudflare-update-firewall.sh` | Script não-interativo (sem prompts) |
+| `cloudflare-update-firewall.service` | Executa o script via systemd |
+| `cloudflare-update-firewall.timer` | Dispara mensalmente, `Persistent=true` |
 
-**Cloudflare Real IP (crítico):**
-Todos os 15 ranges IPv4 e 7 ranges IPv6 da Cloudflare são configurados como `trustedIPs` no entry point 443. Traefik extrai o IP real do visitante dos headers `CF-Connecting-IP` / `X-Forwarded-For` e o usa nos logs e middlewares.
+`Persistent=true` garante que, se a VPS estiver desligada no dia agendado, o timer roda na próxima vez que ligar.
 
-**`acme.json`** — armazena certificados Let's Encrypt. Criado com `chmod 600` obrigatório.
-
-**Como Let's Encrypt HTTP-01 funciona com Cloudflare proxy ativo:**
-```
-LE → http://dominio.com/.well-known/acme-challenge/TOKEN
-   → Cloudflare recebe (não redireciona esse path para HTTPS)
-   → Cloudflare encaminha para VPS porta 80 (de um IP Cloudflare)
-   → UFW permite (IP Cloudflare)
-   → Traefik responde com o token
-   → LE valida e emite o certificado
-```
-
-**Acesso:** `http://<IP_TAILSCALE>:8080/dashboard/`
-
----
-
-### Etapa 3 — Portainer CE
-
-**Diretório:** `/opt/portainer/`
-
-- Porta 9000 — UI web (HTTP)
-- Porta 9443 — UI web (HTTPS)
-- Volume `portainer_data` — dados persistentes
-- **Não** passa pelo Traefik — acesso direto via porta
-- UFW bloqueia acesso externo — acessível apenas via Tailscale
-
-**Acesso:** `http://<IP_TAILSCALE>:9000`
-
----
-
-### Como expor serviços via Traefik
-
-Cada serviço gerenciado pelo Portainer configura seu próprio roteamento via **labels Docker**:
-
-```yaml
-services:
-  minha-app:
-    image: minha-imagem
-    networks:
-      - traefik_public          # obrigatório — conectar na rede do Traefik
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.minha-app.rule=Host(`app.meudominio.com`)"
-      - "traefik.http.routers.minha-app.tls=true"
-      - "traefik.http.routers.minha-app.tls.certresolver=letsencrypt"
-      - "traefik.http.services.minha-app.loadbalancer.server.port=3000"
-
-networks:
-  traefik_public:
-    external: true              # rede criada pelo 04-traefik-and-portainer.sh
-```
-
-Traefik detecta automaticamente o container, gera o certificado Let's Encrypt para `app.meudominio.com` e começa a rotear.
-
-**Requisito no Cloudflare:** domínio deve ter o proxy ativo (nuvem laranja).
+**Quando rodar o `03` manualmente no futuro**, o `docker-user-firewall.service` é reiniciado automaticamente — não é preciso rodar nenhum script adicional.
 
 ---
 
@@ -728,7 +305,7 @@ Traefik detecta automaticamente o container, gera o certificado Let's Encrypt pa
 
 ### Visão Geral
 
-Script de validação que verifica se todas as configurações dos scripts anteriores foram aplicadas corretamente. Gera um relatório com score percentual.
+Valida se todas as configurações dos scripts anteriores foram aplicadas corretamente. Gera relatório com score percentual e log datado.
 
 ```bash
 sudo bash _audit.sh
@@ -741,32 +318,64 @@ sudo bash _audit.sh
 | Seção | Verificações |
 |---|---|
 | Sistema Base | Timezone, NTP, SWAP, Unattended Upgrades |
-| Kernel/sysctl | 17 parâmetros de segurança e performance |
-| Módulos de Kernel | 9 módulos bloqueados |
+| Kernel/sysctl | 17+ parâmetros de segurança e performance |
+| Módulos de Kernel | 9 módulos bloqueados (opcional) |
 | SSH Hardening | PasswordAuth, PubkeyAuth, PermitRootLogin, ListenAddress, criptografia, cloud-init |
 | Tailscale VPN | Instalado, serviço ativo, conectado |
-| Firewall UFW | Ativo, DENY incoming, IPv6, logging medium, Tailscale, regras Cloudflare |
+| Firewall UFW | Ativo, DENY incoming, IPv6, logging medium, Tailscale liberado, IPs Cloudflare |
 | Fail2Ban | Instalado, serviço ativo, jail sshd |
-| CrowdSec | Instalado, serviço ativo, bouncer ativo, 3 collections |
-| Auditd | Instalado, serviço ativo, regras carregadas |
-| Docker | Instalado, serviço ativo, API não exposta |
-| Netdata | Container rodando, URL Tailscale, compose file |
+| Auditd | Instalado, serviço ativo, regras carregadas (opcional) |
+| Docker | Instalado, serviço ativo, daemon.json bind 127.0.0.1, API não exposta |
+| DOCKER-USER Firewall | Serviço enabled + ativo, chain com regras, modo Cloudflare-Only, timer mensal |
 | Logging | Journald limite, rsyslog |
 | Exposição de Portas | Portas inesperadas abertas, SSH no IP público |
 
 ### Output
 
 ```
-✅ PASS  71/73 verificações
+✅ PASS  72/75 verificações
 ❌ FAIL  0 verificações críticas
-⚠️  WARN  2 avisos (opcionais/menores)
+⚠️  WARN  3 avisos (opcionais/menores)
 
-Score: 97% — Excelente
+Score: 96% — Excelente
 ```
 
 - Exit code `0` → sem FAILs
 - Exit code `1` → há FAILs críticos
-- Log salvo em `logs/audit-YYYYMMDD.log`
+- Log salvo em `logs/audit-YYYYMMDD_HHMMSS.log`
+
+---
+
+## Serviços systemd
+
+### `docker-user-firewall.service`
+- **Criado por:** `02-docker.sh`
+- **Script:** `/usr/local/bin/docker-user-firewall.sh`
+- **Executa:** no boot, após `docker.service`
+- **Lógica:** lê IPs Cloudflare do UFW, aplica `DOCKER-USER`
+
+### `cloudflare-update-firewall.service`
+- **Criado por:** `03-cloudflare-update-ufw.sh` (opcional)
+- **Script:** `/usr/local/bin/cloudflare-update-firewall.sh`
+- **Executa:** chamado pelo timer
+
+### `cloudflare-update-firewall.timer`
+- **Criado por:** `03-cloudflare-update-ufw.sh` (opcional)
+- **Dispara:** mensalmente, `Persistent=true`
+- **Efeito:** atualiza UFW + reinicia `docker-user-firewall.service`
+
+```
+Boot:
+  docker.service → docker-user-firewall.service
+                        ↓ lê IPs do UFW → aplica DOCKER-USER
+
+Mensalmente:
+  cloudflare-update-firewall.timer
+    → cloudflare-update-firewall.service
+        → atualiza UFW com IPs Cloudflare
+        → reinicia docker-user-firewall.service
+            → DOCKER-USER reaplica com IPs atualizados
+```
 
 ---
 
@@ -791,56 +400,59 @@ Score: 97% — Excelente
 | `/etc/audit/rules.d/hardening.rules` | Regras do Auditd |
 | `/swap/swapfile` | Arquivo de swap |
 
-### pelo 02-docker-and-netdata.sh
+### pelo 02-docker.sh
 
 | Arquivo | Descrição |
 |---|---|
-| `/opt/netdata/docker-compose.yml` | Compose do Netdata |
-| `/opt/netdata/config/go.d/crowdsec.conf` | Integração CrowdSec |
-| `/opt/netdata/config/go.d/fail2ban.conf` | Integração Fail2Ban |
-| `/opt/netdata/config/go.d/iptables.conf` | Integração iptables |
+| `/etc/docker/daemon.json` | Configuração do Docker daemon (bind 127.0.0.1) |
+| `/usr/local/bin/docker-user-firewall.sh` | Script de regras DOCKER-USER |
+| `/etc/systemd/system/docker-user-firewall.service` | Serviço systemd |
+
+### pelo 03-cloudflare-update-ufw.sh
+
+| Arquivo | Descrição |
+|---|---|
+| `/usr/local/bin/cloudflare-update-firewall.sh` | Script não-interativo (timer) |
+| `/etc/systemd/system/cloudflare-update-firewall.service` | Serviço systemd |
+| `/etc/systemd/system/cloudflare-update-firewall.timer` | Timer mensal |
 
 ---
 
 ## Fluxo de Execução Recomendado
 
 ```
-1. Provisionar VPS Ubuntu (22.04 ou 24.04)
+1. Provisionar VPS Ubuntu 22.04 ou 24.04
 
-2. Acessar via console web ou SSH temporário como root
+2. Acessar via console web ou SSH como root
 
 3. git clone https://github.com/andreluizfaustino/devsecops-vps-startup.git
    cd devsecops-vps-startup/Ubuntu
 
-4. bash 01-startup.sh
+4. sudo bash 01-startup.sh
    → Configurar interativamente (usuário, porta, swap, chave SSH, opcionais)
-   → Autenticar Tailscale no navegador
+   → Autenticar Tailscale no navegador quando solicitado
    → Aguardar reboot automático (~4 min)
 
 5. Conectar via Tailscale
    ssh ubuntu@<IP_TAILSCALE> -p <PORTA>
 
-6. bash 02-docker-and-netdata.sh
-   → Instala Docker
-   → Sobe Netdata com integrações Fail2Ban e métricas
-   → Acesso: http://<IP_TAILSCALE>:19999
+6. sudo bash 02-docker.sh
+   → Confirmar instalação do Docker
+   → Docker instalado + DOCKER-USER configurado + serviço systemd ativo
 
-7. bash 03-cloudflare-update-ufw.sh
-   → Ativa modo Cloudflare-Only (80/443 só para IPs Cloudflare)
-   → Confirmar com 's'
+7. sudo bash 03-cloudflare-update-ufw.sh
+   → Confirmar atualização de IPs
+   → IPs Cloudflare aplicados no UFW + DOCKER-USER
+   → Configurar timer mensal (recomendado: S)
+   → A partir daqui: acesso direto por IP às portas 80/443 é bloqueado
 
-8. bash 04-traefik-and-portainer.sh
-   → Informa email para Let's Encrypt
-   → Instala Traefik v3 com SSL automático
-   → Instala Portainer CE
-   → Traefik:  http://<IP_TAILSCALE>:8080/dashboard/
-   → Portainer: http://<IP_TAILSCALE>:9000
+8. sudo bash _audit.sh
+   → Validar score (esperado: ~96-97%)
 
-9. bash _audit.sh
-   → Validar score (esperado: ~97%)
-
-10. Manutenção futura:
-    - Atualizar IPs Cloudflare: bash 03-cloudflare-update-ufw.sh
-    - Health check: bash _audit.sh
-    - Nova VPS: git pull && repetir passos 4-9
+Manutenção futura:
+   → Atualizar IPs Cloudflare: sudo bash 03-cloudflare-update-ufw.sh
+   → Health check:             sudo bash _audit.sh
+   → Logs do firewall:         journalctl -u docker-user-firewall.service
+   → Logs do timer mensal:     journalctl -u cloudflare-update-firewall.service
+   → Nova VPS: git pull && repetir passos 4-8
 ```
