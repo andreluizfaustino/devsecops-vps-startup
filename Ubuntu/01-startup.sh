@@ -51,8 +51,28 @@ DU_SCRIPT="/usr/local/bin/docker-user-firewall.sh"
 # apt sem perguntas e esperando o lock do dpkg (VPS recém-criada costuma estar atualizando)
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
-APT_GET=(apt-get -y -qq -o DPkg::Lock::Timeout=600
+APT_GET=(apt-get -y -qq -o DPkg::Lock::Timeout=600 -o Acquire::Retries=3
          -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+APT_IPV4_CONF="/etc/apt/apt.conf.d/99force-ipv4"
+
+# apt com fallback para IPv4: algumas VPS têm IPv6 de saída quebrado e o apt
+# não troca sozinho de protocolo. Se o IPv4 resolver, fica gravado para o
+# unattended-upgrades também funcionar.
+apt_run() {
+    if "${APT_GET[@]}" "$@" >> "$LOG_FILE" 2>&1; then
+        return 0
+    fi
+    if [ -f "$APT_IPV4_CONF" ]; then
+        return 1
+    fi
+    log WARNING "apt falhou ($*) — tentando de novo forçando IPv4 (IPv6 desta VPS pode estar instável)"
+    if "${APT_GET[@]}" -o Acquire::ForceIPv4=true "$@" >> "$LOG_FILE" 2>&1; then
+        echo 'Acquire::ForceIPv4 "true";  // gerado por 01-startup.sh: IPv6 de saída instável' > "$APT_IPV4_CONF"
+        log WARNING "IPv4 funcionou — apt fixado em IPv4 ($APT_IPV4_CONF)"
+        return 0
+    fi
+    return 1
+}
 
 COLOR_RESET='\033[0m'
 COLOR_RED='\033[0;31m'
@@ -128,11 +148,12 @@ get_completed_phases() { if [ -f "$CHECKPOINT_FILE" ]; then wc -l < "$CHECKPOINT
 show_progress() {
     local current total=$TOTAL_PHASES
     current=$(get_completed_phases)
-    local filled=$((current * 40 / total))
-    printf "${COLOR_BOLD}Progresso:${COLOR_RESET} ["
-    printf "%${filled}s" "" | tr ' ' '█'
-    printf "%$((40 - filled))s" "" | tr ' ' '░'
-    printf "] %d%% (%d/%d fases)\n" $((current * 100 / total)) "$current" "$total"
+    local filled=$((current * 40 / total)) bar="" i
+    for ((i = 0; i < 40; i++)); do
+        if [ "$i" -lt "$filled" ]; then bar+="█"; else bar+="░"; fi
+    done
+    printf "${COLOR_BOLD}Progresso:${COLOR_RESET} [%s] %d%% (%d/%d fases)\n" \
+        "$bar" $((current * 100 / total)) "$current" "$total"
 }
 
 run_all_phases() {
@@ -195,8 +216,8 @@ detect_hardware() {
     HW_RAM_GB=$(( (HW_RAM_MB + 512) / 1024 ))        # arredonda (15.6 GB → 16)
     [ "$HW_RAM_GB" -lt 1 ] && HW_RAM_GB=1
     HW_SWAP_MB=$(awk '/^SwapTotal:/ {print int($2/1024)}' /proc/meminfo)
-    HW_DISK_TOTAL_GB=$(df -BG --output=size / | tail -1 | tr -dc '0-9')
-    HW_DISK_FREE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+    HW_DISK_TOTAL_GB=$(df -BG --output=size / | tail -n 1 | tr -dc '0-9')
+    HW_DISK_FREE_GB=$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')
 }
 
 # Regra (servidor, sem hibernação):
@@ -433,16 +454,16 @@ phase_system_update() {
     done
 
     log INFO "Atualizando pacotes (pode demorar)..."
-    "${APT_GET[@]}" update >> "$LOG_FILE" 2>&1
-    "${APT_GET[@]}" full-upgrade >> "$LOG_FILE" 2>&1
-    "${APT_GET[@]}" install curl ca-certificates gnupg ufw iptables >> "$LOG_FILE" 2>&1
-    "${APT_GET[@]}" autoremove --purge >> "$LOG_FILE" 2>&1
-    "${APT_GET[@]}" autoclean >> "$LOG_FILE" 2>&1
+    apt_run update
+    apt_run full-upgrade
+    apt_run install curl ca-certificates gnupg ufw iptables
+    apt_run autoremove --purge
+    apt_run autoclean
     log SUCCESS "Sistema atualizado"
 }
 
 phase_unattended_upgrades() {
-    "${APT_GET[@]}" install unattended-upgrades update-notifier-common >> "$LOG_FILE" 2>&1
+    apt_run install unattended-upgrades update-notifier-common
 
     cat > /etc/apt/apt.conf.d/52unattended-upgrades-hardening << 'EOF'
 // Gerado por 01-startup.sh — apenas atualizações de SEGURANÇA, sem reboot automático
@@ -981,9 +1002,9 @@ Components: stable
 Architectures: $(dpkg --print-architecture)
 Signed-By: /etc/apt/keyrings/docker.asc
 EOF
-        "${APT_GET[@]}" update >> "$LOG_FILE" 2>&1
+        apt_run update
         log INFO "Instalando Docker Engine..."
-        "${APT_GET[@]}" install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >> "$LOG_FILE" 2>&1
+        apt_run install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
     fi
 
     # Padrões seguros:

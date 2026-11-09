@@ -307,7 +307,7 @@ check_tailscale() {
         log_result FAIL "Tailscale instalado" "(não encontrado — sem ele não há SSH)"
         return
     fi
-    log_result PASS "Tailscale instalado" "($(tailscale version 2>/dev/null | head -1))"
+    log_result PASS "Tailscale instalado" "($(tailscale version 2>/dev/null | head -n 1))"
 
     if systemctl is-active --quiet tailscaled; then
         log_result PASS "tailscaled ativo"
@@ -316,7 +316,7 @@ check_tailscale() {
     fi
 
     local ip4
-    ip4=$(tailscale ip -4 2>/dev/null | head -1)
+    ip4=$(tailscale ip -4 2>/dev/null | head -n 1)
     if [ -n "$ip4" ]; then
         log_result PASS "Tailscale conectado" "($ip4)"
     else
@@ -496,7 +496,7 @@ check_docker_user() {
         | grep -vE '(0\.0\.0\.0|\[::\]|:::):(80|443)->' || true)
     if [ -n "$exposed" ]; then
         log_result WARN "Portas publicadas em 0.0.0.0" "(bloqueadas pelo DOCKER-USER, mas prefira o IP do Tailscale)"
-        echo "$exposed" | sed 's/^/           /' | head -10
+        echo "$exposed" | sed 's/^/           /' | head -n 10
     else
         log_result PASS "Nenhuma porta extra publicada em 0.0.0.0"
     fi
@@ -507,8 +507,8 @@ check_logging() {
 
     local cfg max storage
     cfg=$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null)
-    max=$(grep -E '^SystemMaxUse=' <<< "$cfg" | tail -1 | cut -d= -f2)
-    storage=$(grep -E '^Storage=' <<< "$cfg" | tail -1 | cut -d= -f2)
+    max=$(grep -E '^SystemMaxUse=' <<< "$cfg" | tail -n 1 | cut -d= -f2)
+    storage=$(grep -E '^Storage=' <<< "$cfg" | tail -n 1 | cut -d= -f2)
 
     if [ -n "$max" ]; then
         log_result PASS "Journald com limite" "($max)"
@@ -547,7 +547,7 @@ check_exposure() {
         | grep -v 'docker-proxy' || true)
     if [ -n "$listeners" ]; then
         log_result WARN "Serviços do host em todos os IPs" "(bloqueados pelo UFW, mas confira)"
-        echo "$listeners" | sed -E 's/users:\(\("([^"]+)".*/(\1)/' | awk '{print "           " $1, $2}' | sort -u | head -10
+        echo "$listeners" | sed -E 's/users:\(\("([^"]+)".*/(\1)/' | awk '{print "           " $1, $2}' | sort -u | head -n 10
     else
         log_result PASS "Nenhum serviço do host exposto além de 80/443"
     fi
@@ -576,7 +576,7 @@ show_report() {
     else
         echo -e "  Score: ${COLOR_BOLD}${COLOR_RED}${score}% — Corrija os FAILs${COLOR_RESET}"
         echo ""
-        grep "^\[FAIL\]" "$AUDIT_LOG" | sed 's/^\[FAIL\]/  ❌/' | head -20
+        grep "^\[FAIL\]" "$AUDIT_LOG" | sed 's/^\[FAIL\]/  ❌/' | head -n 20
     fi
     echo ""
     echo -e "  📄 Log: ${COLOR_CYAN}$AUDIT_LOG${COLOR_RESET}"
