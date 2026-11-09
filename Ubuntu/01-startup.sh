@@ -1,41 +1,59 @@
 #!/bin/bash
 # ════════════════════════════════════════════════════════
-# Script de Hardening de Servidor Ubuntu - Default VPS
-# Version: 1.0.0
+# Setup + Hardening de VPS Ubuntu (24.04 / 26.04 LTS)
+# Version: 2.0.0
 # Author: @andreluizfaustino
 # Repository: https://github.com/andreluizfaustino/devsecops-vps-startup
+#
+# Resultado final:
+#   • SSH apenas via Tailscale, apenas chave, root bloqueado
+#   • UFW: tudo bloqueado, exceto 80/443 (Cloudflare ou público) e Tailscale
+#   • Docker com firewall próprio (DOCKER-USER) — containers não furam o UFW
+#   • Atualizações de segurança automáticas (sem reboot automático)
+#
+# Uso: sudo bash 01-startup.sh
 # ════════════════════════════════════════════════════════
 
-set -uo pipefail
-IFS=$'\n\t'
+set -Eeuo pipefail
 
 # ════════════════════════════════════════════════════════
 # VARIÁVEIS GLOBAIS
 # ════════════════════════════════════════════════════════
 
-# Diretório base do script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# Diretórios de log e checkpoint
 LOG_DIR="${SCRIPT_DIR}/logs"
 CHECKPOINT_FILE="${SCRIPT_DIR}/.startup-checkpoint"
+CONFIG_FILE="${SCRIPT_DIR}/.startup-config"
 LOG_FILE="${LOG_DIR}/startup-$(date +%Y%m%d_%H%M%S).log"
 ERROR_LOG="${LOG_DIR}/startup-errors.log"
-
-# Garantir que diretório de logs existe
 mkdir -p "$LOG_DIR"
+chmod 700 "$LOG_DIR"
 
-# Variáveis de configuração (serão preenchidas interativamente)
+# Configuração (preenchida interativamente; a senha NUNCA é gravada em disco)
 SSH_USER=""
 SSH_USER_PASS=""
-SSH_PORT=""
+SSH_PORT="22"          # fixo: o SSH escuta só no Tailscale, trocar a porta não agrega segurança
 SWAP_SIZE=""
 PUB_KEY=""
+TS_AUTHKEY=""          # opcional, não é gravado em disco
+CF_ONLY="S"            # 80/443 apenas para IPs da Cloudflare
+INSTALL_DOCKER="S"     # Docker + firewall dos containers (DOCKER-USER)
 TAILSCALE_IPV4=""
 TAILSCALE_IPV6=""
-INSTALL_MOD_BLOCK=""
 
-# Cores para output
+# Arquivos gerados no servidor
+SSHD_DROPIN="/etc/ssh/sshd_config.d/00-hardening.conf"
+SYSCTL_FILE="/etc/sysctl.d/90-hardening.conf"
+CF_LIST="/etc/cloudflare-ips.txt"
+CF_SCRIPT="/usr/local/bin/cloudflare-update-firewall.sh"
+DU_SCRIPT="/usr/local/bin/docker-user-firewall.sh"
+
+# apt sem perguntas e esperando o lock do dpkg (VPS recém-criada costuma estar atualizando)
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+APT_GET=(apt-get -y -qq -o DPkg::Lock::Timeout=600
+         -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+
 COLOR_RESET='\033[0m'
 COLOR_RED='\033[0;31m'
 COLOR_GREEN='\033[0;32m'
@@ -44,120 +62,95 @@ COLOR_BLUE='\033[0;34m'
 COLOR_CYAN='\033[0;36m'
 COLOR_BOLD='\033[1m'
 
-# Total de fases (15 fases)
-TOTAL_PHASES=15
-
-# Tempo inicial do script
+# Ordem das fases: id|título|função
+PHASES=(
+    "user|Usuário SSH e senha|phase_user"
+    "timezone|Timezone e NTP|phase_timezone"
+    "system_update|Atualizar sistema|phase_system_update"
+    "unattended_upgrades|Atualizações automáticas de segurança|phase_unattended_upgrades"
+    "sysctl|Kernel e rede (sysctl + limites)|phase_sysctl"
+    "kernel_modules|Bloqueio de módulos do kernel|phase_kernel_modules"
+    "swap|SWAP|phase_swap"
+    "ssh_key|Chave SSH|phase_ssh_key"
+    "tailscale|Tailscale VPN|phase_tailscale"
+    "ssh_config|SSH apenas via Tailscale|phase_ssh_config"
+    "firewall|Firewall UFW + Cloudflare|phase_firewall"
+    "docker|Docker + firewall dos containers (DOCKER-USER)|phase_docker"
+    "logging|Logs do sistema (journald)|phase_logging"
+)
+TOTAL_PHASES=${#PHASES[@]}
 START_TIME=$(date +%s)
 
 # ════════════════════════════════════════════════════════
-# FUNÇÕES DE TEMPO
-# ════════════════════════════════════════════════════════
-
-format_time() {
-    local seconds=$1
-    local minutes=$((seconds / 60))
-    local remaining_seconds=$((seconds % 60))
-    
-    if [ $minutes -eq 0 ]; then
-        echo "${remaining_seconds}s"
-    else
-        echo "${minutes}m ${remaining_seconds}s"
-    fi
-}
-
-get_elapsed_time() {
-    local current=$(date +%s)
-    local elapsed=$((current - START_TIME))
-    format_time $elapsed
-}
-
-# ════════════════════════════════════════════════════════
-# FUNÇÕES DE LOGGING
+# LOG, ERROS E TEMPO
 # ════════════════════════════════════════════════════════
 
 log() {
-    local level="$1"
-    shift
-    local message="$@"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    
-    # Log para arquivo (sempre)
+    local level="$1"; shift
+    local message="$*"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
-    
-    # Log para terminal (com cores)
     case "$level" in
-        INFO)
-            echo -e "${COLOR_CYAN}ℹ ${COLOR_RESET}$message"
-            ;;
-        SUCCESS)
-            echo -e "${COLOR_GREEN}✅${COLOR_RESET} $message"
-            ;;
-        WARNING)
-            echo -e "${COLOR_YELLOW}⚠️ ${COLOR_RESET}$message"
-            ;;
-        ERROR)
-            echo -e "${COLOR_RED}❌${COLOR_RESET} $message"
-            echo "[$timestamp] [ERROR] $message" >> "$ERROR_LOG"
-            ;;
-        PHASE)
-            echo -e "\n${COLOR_BOLD}${COLOR_BLUE}═══ $message${COLOR_RESET}\n"
-            ;;
-        *)
-            echo "$message"
-            ;;
+        INFO)    echo -e "${COLOR_CYAN}ℹ ${COLOR_RESET}$message" ;;
+        SUCCESS) echo -e "${COLOR_GREEN}✅${COLOR_RESET} $message" ;;
+        WARNING) echo -e "${COLOR_YELLOW}⚠️ ${COLOR_RESET}$message" ;;
+        ERROR)   echo -e "${COLOR_RED}❌${COLOR_RESET} $message"
+                 echo "[$timestamp] [ERROR] $message" >> "$ERROR_LOG" ;;
+        PHASE)   echo -e "\n${COLOR_BOLD}${COLOR_BLUE}═══ $message${COLOR_RESET}\n" ;;
+        *)       echo "$message" ;;
     esac
 }
 
-# ════════════════════════════════════════════════════════
-# FUNÇÕES DE CHECKPOINT
-# ════════════════════════════════════════════════════════
-
-is_phase_completed() {
-    local phase="$1"
-    if [ -f "$CHECKPOINT_FILE" ]; then
-        grep -q "^${phase}$" "$CHECKPOINT_FILE" 2>/dev/null
-        return $?
-    fi
-    return 1
+on_error() {
+    local rc=$? line=$1 cmd=$2
+    trap - ERR
+    log ERROR "Falha (código $rc) na linha $line: $cmd"
+    log ERROR "Veja o log: $LOG_FILE"
+    log ERROR "Corrija o problema e rode o script de novo — ele continua da fase em que parou."
+    exit "$rc"
 }
+trap 'on_error $LINENO "$BASH_COMMAND"' ERR
 
-mark_phase_completed() {
-    local phase="$1"
-    echo "$phase" >> "$CHECKPOINT_FILE"
-    log SUCCESS "Fase '$phase' concluída e salva no checkpoint"
-}
-
-get_completed_phases() {
-    if [ -f "$CHECKPOINT_FILE" ]; then
-        wc -l < "$CHECKPOINT_FILE" | tr -d ' '
-    else
-        echo "0"
-    fi
-}
-
-reset_checkpoint() {
-    if [ -f "$CHECKPOINT_FILE" ]; then
-        rm -f "$CHECKPOINT_FILE"
-        log INFO "Checkpoint resetado"
-    fi
+format_time() {
+    local s=$1
+    if [ "$s" -lt 60 ]; then echo "${s}s"; else echo "$((s / 60))m $((s % 60))s"; fi
 }
 
 # ════════════════════════════════════════════════════════
-# FUNÇÃO DE PROGRESS BAR
+# CHECKPOINT E EXECUÇÃO DAS FASES
 # ════════════════════════════════════════════════════════
+
+is_phase_completed() { [ -f "$CHECKPOINT_FILE" ] && grep -qx "$1" "$CHECKPOINT_FILE"; }
+mark_phase_completed() { echo "$1" >> "$CHECKPOINT_FILE"; }
+get_completed_phases() { if [ -f "$CHECKPOINT_FILE" ]; then wc -l < "$CHECKPOINT_FILE" | tr -d ' '; else echo 0; fi; }
 
 show_progress() {
-    local current=$(get_completed_phases)
-    local total=$TOTAL_PHASES
-    local percentage=$((current * 100 / total))
-    local filled=$((current * 50 / total))
-    local empty=$((50 - filled))
-    
-    printf "\r${COLOR_BOLD}Progresso:${COLOR_RESET} ["
-    printf "${COLOR_GREEN}%${filled}s${COLOR_RESET}" | tr ' ' '█'
-    printf "%${empty}s" | tr ' ' '░'
-    printf "] ${COLOR_CYAN}%d%%${COLOR_RESET} (%d/%d fases)" "$percentage" "$current" "$total"
+    local current total=$TOTAL_PHASES
+    current=$(get_completed_phases)
+    local filled=$((current * 40 / total))
+    printf "${COLOR_BOLD}Progresso:${COLOR_RESET} ["
+    printf "%${filled}s" "" | tr ' ' '█'
+    printf "%$((40 - filled))s" "" | tr ' ' '░'
+    printf "] %d%% (%d/%d fases)\n" $((current * 100 / total)) "$current" "$total"
+}
+
+run_all_phases() {
+    local n=0 entry id title fn start
+    for entry in "${PHASES[@]}"; do
+        n=$((n + 1))
+        IFS='|' read -r id title fn <<< "$entry"
+        if is_phase_completed "$id"; then
+            log INFO "Fase $n/$TOTAL_PHASES ($title) já concluída. Pulando..."
+            continue
+        fi
+        log PHASE "Fase $n/$TOTAL_PHASES: $title"
+        start=$(date +%s)
+        "$fn"
+        mark_phase_completed "$id"
+        log SUCCESS "Fase $n concluída em $(format_time $(( $(date +%s) - start )))"
+        show_progress
+    done
 }
 
 # ════════════════════════════════════════════════════════
@@ -165,895 +158,598 @@ show_progress() {
 # ════════════════════════════════════════════════════════
 
 check_root() {
-    if [ "$EUID" -ne 0 ]; then 
-        log ERROR "Este script deve ser executado como ROOT"
+    if [ "$EUID" -ne 0 ]; then
+        echo "❌ Este script deve ser executado como root: sudo bash 01-startup.sh"
         exit 1
     fi
 }
 
 check_ubuntu() {
-    if ! grep -q "Ubuntu" /etc/os-release 2>/dev/null; then
-        log WARNING "Este script foi projetado para Ubuntu. Pode não funcionar corretamente em outros sistemas."
-        read -p "Deseja continuar mesmo assim? (s/N): " confirm
-        if [[ ! "$confirm" =~ ^[Ss]$ ]]; then
-            exit 1
-        fi
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    if [ "${ID:-}" != "ubuntu" ]; then
+        log ERROR "Este script é apenas para Ubuntu (detectado: ${PRETTY_NAME:-desconhecido})"
+        exit 1
     fi
+    case "${VERSION_ID:-}" in
+        24.04|26.04) log INFO "Sistema: $PRETTY_NAME" ;;
+        *)
+            log WARNING "Testado em Ubuntu 24.04 e 26.04 LTS. Detectado: $PRETTY_NAME"
+            read -r -p "Continuar mesmo assim? (s/N): " confirm
+            [[ "$confirm" =~ ^[Ss]$ ]] || exit 1
+            ;;
+    esac
+}
+
+public_iface() {
+    ip -4 route show default 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}'
 }
 
 # ════════════════════════════════════════════════════════
-# CONFIGURAÇÃO INTERATIVA (apenas se não houver checkpoint)
+# DETECÇÃO DE HARDWARE E SUGESTÃO DE SWAP
 # ════════════════════════════════════════════════════════
 
-interactive_config() {
-    if [ -f "$CHECKPOINT_FILE" ]; then
-        log INFO "Checkpoint encontrado. Recuperando configuração anterior..."
-        # Carregar variáveis do checkpoint (se necessário)
-        return
+detect_hardware() {
+    HW_CPUS=$(nproc 2>/dev/null || echo 1)
+    HW_RAM_MB=$(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo)
+    HW_RAM_GB=$(( (HW_RAM_MB + 512) / 1024 ))        # arredonda (15.6 GB → 16)
+    [ "$HW_RAM_GB" -lt 1 ] && HW_RAM_GB=1
+    HW_SWAP_MB=$(awk '/^SwapTotal:/ {print int($2/1024)}' /proc/meminfo)
+    HW_DISK_TOTAL_GB=$(df -BG --output=size / | tail -1 | tr -dc '0-9')
+    HW_DISK_FREE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+}
+
+# Regra (servidor, sem hibernação):
+#   RAM ≤ 2 GB  → 2× RAM   (máquina pequena precisa de folga contra OOM)
+#   RAM ≤ 32 GB → 4 GB     (swap é só rede de segurança, não memória extra)
+#   RAM > 32 GB → 8 GB
+# Limite: nunca mais que 10% do disco livre.
+choose_swap_size() {
+    detect_hardware
+
+    local rec
+    if   [ "$HW_RAM_GB" -le 2 ];  then rec=$((HW_RAM_GB * 2))
+    elif [ "$HW_RAM_GB" -le 32 ]; then rec=4
+    else                               rec=8
     fi
-    
+
+    local cap=$((HW_DISK_FREE_GB / 10))
+    [ "$cap" -lt 1 ] && cap=1
+    [ "$rec" -gt "$cap" ] && rec=$cap
+
+    local min=$((rec / 2)); [ "$min" -lt 1 ] && min=1
+    local big=$((rec * 2)); [ "$big" -gt "$cap" ] && big=$cap
+
+    echo "Hardware detectado:"
+    echo "  • CPU:   ${HW_CPUS} vCPU"
+    echo "  • RAM:   ${HW_RAM_GB} GB (${HW_RAM_MB} MB)"
+    echo "  • Disco: ${HW_DISK_TOTAL_GB} GB total, ${HW_DISK_FREE_GB} GB livres"
+    if [ "$HW_SWAP_MB" -gt 0 ]; then
+        echo "  • Swap atual: ${HW_SWAP_MB} MB (será substituído)"
+    else
+        echo "  • Swap atual: nenhum"
+    fi
     echo ""
-    echo -e "${COLOR_BOLD}════════════════════════════════════════════════════════${COLOR_RESET}"
-    echo -e "${COLOR_BOLD}  CONFIGURAÇÃO INICIAL DO SISTEMA${COLOR_RESET}"
-    echo -e "${COLOR_BOLD}════════════════════════════════════════════════════════${COLOR_RESET}"
+    echo "Opções de SWAP para este servidor:"
+    echo "  1) Mínimo      — ${min} GB  (só proteção contra falta de memória)"
+    echo "  2) Recomendado — ${rec} GB  ✅"
+    echo "  3) Folgado     — ${big} GB  (muitos containers ou builds pesados)"
+    echo "  4) Outro valor (1 a ${cap} GB)"
     echo ""
 
-    # ETAPA 1: Escolher usuário SSH
-    log PHASE "ETAPA 1/5: Configurar usuário SSH"
-    echo "Escolha qual usuário terá acesso SSH:"
-    echo "  1) root (manterá acesso root com chave SSH)"
-    echo "  2) ubuntu (criar/usar usuário ubuntu - recomendado)"
-    echo "  3) outro (especificar nome de usuário customizado)"
-    echo ""
+    local swap_choice
     while true; do
-        read -p "Opção [1-3]: " user_choice
-        case $user_choice in
-            1)
-                SSH_USER="root"
-                log SUCCESS "Usuário SSH será: root"
-                log WARNING "⚠️  Root login será permitido apenas com chave SSH"
-                break
-                ;;
-            2)
-                SSH_USER="ubuntu"
-                log SUCCESS "Usuário SSH será: ubuntu"
-                break
-                ;;
-            3)
-                read -p "Nome do usuário: " SSH_USER
-                if [[ "$SSH_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] && [ ${#SSH_USER} -le 32 ]; then
-                    log SUCCESS "Usuário SSH será: $SSH_USER"
+        read -r -p "Opção [1-4] (padrão: 2): " swap_choice
+        swap_choice=${swap_choice:-2}
+        case $swap_choice in
+            1) SWAP_SIZE=$min; break ;;
+            2) SWAP_SIZE=$rec; break ;;
+            3) SWAP_SIZE=$big; break ;;
+            4)
+                read -r -p "Tamanho do SWAP em GB (1-${cap}): " SWAP_SIZE
+                if [[ "$SWAP_SIZE" =~ ^[0-9]+$ ]] && [ "$SWAP_SIZE" -ge 1 ] && [ "$SWAP_SIZE" -le "$cap" ]; then
                     break
-                else
-                    log ERROR "Nome de usuário inválido. Use apenas letras minúsculas, números, _ e -"
                 fi
+                log ERROR "Valor inválido. Use um número entre 1 e ${cap}"
                 ;;
-            *)
-                log ERROR "Opção inválida. Escolha 1, 2 ou 3"
-                ;;
+            *) log ERROR "Opção inválida. Escolha 1, 2, 3 ou 4" ;;
         esac
     done
-    echo ""
+}
 
-    # ETAPA 2: Senha do usuário (apenas se não for root)
-    if [ "$SSH_USER" != "root" ]; then
-        log PHASE "ETAPA 2/5: Definir senha para usuário $SSH_USER"
-        while true; do
-            read -s -p "Digite a nova senha do usuário $SSH_USER: " SSH_USER_PASS
-            echo
-            read -s -p "Repita a senha: " SSH_USER_PASS2
-            echo
-            
-            if [ "$SSH_USER_PASS" = "$SSH_USER_PASS2" ]; then
-                if [ -z "$SSH_USER_PASS" ]; then
-                    log ERROR "Senha não pode ser vazia"
-                    continue
+# ════════════════════════════════════════════════════════
+# CONFIGURAÇÃO INTERATIVA
+# ════════════════════════════════════════════════════════
+
+prompt_password() {
+    echo "Esta senha NÃO serve para SSH (SSH é só por chave)."
+    echo "Ela é usada no 'sudo' e no console web da VPS se o Tailscale cair — guarde-a!"
+    echo ""
+    local pass2
+    while true; do
+        read -r -s -p "Digite a nova senha do usuário $SSH_USER: " SSH_USER_PASS; echo
+        read -r -s -p "Repita a senha: " pass2; echo
+        if [ -z "$SSH_USER_PASS" ]; then
+            log ERROR "Senha não pode ser vazia"
+        elif [ ${#SSH_USER_PASS} -lt 12 ]; then
+            log ERROR "Use pelo menos 12 caracteres"
+        elif [ "$SSH_USER_PASS" != "$pass2" ]; then
+            log ERROR "As senhas não conferem. Tente novamente."
+        else
+            break
+        fi
+    done
+    log SUCCESS "Senha definida"
+}
+
+interactive_config() {
+    echo ""
+    echo -e "${COLOR_BOLD}════════════════════════════════════════════════════════${COLOR_RESET}"
+    echo -e "${COLOR_BOLD}  CONFIGURAÇÃO INICIAL${COLOR_RESET}"
+    echo -e "${COLOR_BOLD}════════════════════════════════════════════════════════${COLOR_RESET}"
+
+    # 1) Usuário (root nunca tem acesso SSH)
+    log PHASE "PERGUNTA 1/5: Usuário SSH"
+    echo "Escolha qual usuário terá acesso SSH (login como root fica bloqueado):"
+    echo "  1) ubuntu (recomendado)"
+    echo "  2) outro (nome customizado)"
+    echo ""
+    local user_choice
+    while true; do
+        read -r -p "Opção [1-2] (padrão: 1): " user_choice
+        case ${user_choice:-1} in
+            1) SSH_USER="ubuntu"; break ;;
+            2)
+                read -r -p "Nome do usuário: " SSH_USER
+                if [ "$SSH_USER" = "root" ]; then
+                    log ERROR "root não é permitido. Escolha outro nome"
+                elif [[ "$SSH_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] && [ ${#SSH_USER} -le 32 ]; then
+                    break
+                else
+                    log ERROR "Nome inválido. Use letras minúsculas, números, _ e -"
                 fi
-                break
-            else
-                log ERROR "As senhas não conferem. Tente novamente."
-            fi
-        done
-        log SUCCESS "Senha definida"
-        echo ""
-    else
-        log INFO "Usuário root - senha não será alterada"
-        echo ""
-    fi
+                ;;
+            *) log ERROR "Opção inválida. Escolha 1 ou 2" ;;
+        esac
+    done
+    log SUCCESS "Usuário SSH: $SSH_USER"
 
-    # ETAPA 3: Porta SSH
-    log PHASE "ETAPA 3/5: Configurar porta SSH"
+    # 2) Senha
+    log PHASE "PERGUNTA 2/5: Senha do usuário $SSH_USER"
+    prompt_password
+
+    # 3) Swap
+    log PHASE "PERGUNTA 3/5: SWAP"
+    choose_swap_size
+    log SUCCESS "SWAP: ${SWAP_SIZE} GB"
+
+    # 4) Chave pública
+    log PHASE "PERGUNTA 4/5: Chave pública SSH"
+    echo "No seu computador: cat ~/.ssh/<sua-chave>.pub"
     while true; do
-        read -p "Digite a porta SSH desejada (22 ou 1024-65535) [padrão: 2222]: " SSH_PORT
-        SSH_PORT=${SSH_PORT:-2222}
-        
-        if [[ "$SSH_PORT" =~ ^[0-9]+$ ]] && ([ "$SSH_PORT" -eq 22 ] || ([ "$SSH_PORT" -ge 1024 ] && [ "$SSH_PORT" -le 65535 ])); then
+        read -r -p "Cole sua chave pública SSH: " PUB_KEY
+        if [ -n "$PUB_KEY" ] && ssh-keygen -l -f - <<< "$PUB_KEY" &>/dev/null; then
             break
-        else
-            log ERROR "Porta inválida. Deve ser 22 ou um número entre 1024 e 65535"
         fi
+        log ERROR "Chave inválida. Cole a linha inteira (ex.: ssh-ed25519 AAAA... comentario)"
     done
-    log SUCCESS "Porta SSH será: $SSH_PORT"
-    echo ""
+    log SUCCESS "Chave válida: $(ssh-keygen -l -f - <<< "$PUB_KEY" | awk '{print $2}')"
 
-    # ETAPA 4: SWAP
-    log PHASE "ETAPA 4/5: Configurar SWAP"
-    while true; do
-        read -p "Digite o tamanho do SWAP em GB [padrão: 2]: " SWAP_SIZE
-        SWAP_SIZE=${SWAP_SIZE:-2}
-        
-        if [[ "$SWAP_SIZE" =~ ^[0-9]+$ ]] && [ "$SWAP_SIZE" -gt 0 ]; then
-            break
-        else
-            log ERROR "Tamanho inválido. Deve ser um número maior que 0"
-        fi
-    done
-    log SUCCESS "SWAP será: ${SWAP_SIZE}GB"
+    # 5) Tailscale, Cloudflare e Docker
+    log PHASE "PERGUNTA 5/5: Tailscale, Cloudflare e Docker"
+    echo "Tailscale auth key (opcional). Deixe vazio para autenticar pelo navegador."
+    echo "  Gerar em: https://login.tailscale.com/admin/settings/keys"
+    read -r -s -p "Auth key: " TS_AUTHKEY; echo
     echo ""
+    echo "Os domínios deste servidor passam pelo proxy da Cloudflare (nuvem laranja)?"
+    echo "  S = portas 80/443 aceitam SÓ IPs da Cloudflare (recomendado)"
+    echo "  n = portas 80/443 abertas para qualquer IP"
+    read -r -p "Modo Cloudflare-only? [S/n]: " CF_ONLY
+    CF_ONLY=${CF_ONLY:-S}
+    [[ "$CF_ONLY" =~ ^[Ss]$ ]] && CF_ONLY="S" || CF_ONLY="N"
+    echo ""
+    echo "Instalar o Docker? (necessário para Portainer, Traefik e containers)"
+    echo "  Junto vem o firewall dos containers: o Docker não consegue abrir portas para a internet."
+    read -r -p "Instalar Docker? [S/n]: " INSTALL_DOCKER
+    [[ "${INSTALL_DOCKER:-S}" =~ ^[Ss]$ ]] && INSTALL_DOCKER="S" || INSTALL_DOCKER="N"
 
-    # ETAPA 5: Chave SSH pública
-    log PHASE "ETAPA 5/5: Configurar autenticação SSH"
-    while true; do
-        read -p "Cole sua chave pública SSH: " PUB_KEY
-        
-        if [ -n "$PUB_KEY" ]; then
-            # Validação básica de chave SSH
-            if [[ "$PUB_KEY" =~ ^ssh-(rsa|ed25519|ecdsa) ]]; then
-                break
-            else
-                log ERROR "Formato de chave SSH inválido. Deve começar com 'ssh-rsa', 'ssh-ed25519' ou 'ssh-ecdsa'"
-            fi
-        else
-            log ERROR "Chave SSH não pode ser vazia"
-        fi
-    done
-    log SUCCESS "Chave SSH configurada"
     echo ""
-
-    # ETAPA 6: Componentes Opcionais de Segurança
-    echo ""
-    echo -e "${COLOR_BOLD}════════════════════════════════════════════════════════${COLOR_RESET}"
-    echo -e "${COLOR_BOLD}  COMPONENTES OPCIONAIS DE SEGURANÇA${COLOR_RESET}"
-    echo -e "${COLOR_BOLD}════════════════════════════════════════════════════════${COLOR_RESET}"
-    echo ""
-    echo "Selecione os componentes OPCIONAIS que deseja instalar:"
-    echo ""
-    
-    # Unattended Upgrades
-    echo -e "${COLOR_BOLD}[1] Unattended Upgrades${COLOR_RESET} (atualizações automáticas)"
-    echo "    • Instala patches de segurança automaticamente"
-    echo "    • Reboot manual se necessário"
-    echo "    • Tempo: ~2 min"
-    read -p "    Instalar? [S/n]: " INSTALL_UPGRADES
-    INSTALL_UPGRADES=${INSTALL_UPGRADES:-S}
-    echo ""
-    
-    # Auditd
-    echo -e "${COLOR_BOLD}[2] Auditd${COLOR_RESET} (monitoramento avançado)"
-    echo "    • Registra acessos a arquivos críticos"
-    echo "    • 5 regras otimizadas (overhead ~1%)"
-    echo "    • Tempo: ~2 min"
-    read -p "    Instalar? [S/n]: " INSTALL_AUDITD
-    INSTALL_AUDITD=${INSTALL_AUDITD:-S}
-    echo ""
-    
-    # Logging
-    echo -e "${COLOR_BOLD}[4] Logging Avançado${COLOR_RESET} (logrotate + journald)"
-    echo "    • Configura rotação de logs"
-    echo "    • Limita journald a 500MB"
-    echo "    • Tempo: ~5 segundos"
-    read -p "    Instalar? [S/n]: " INSTALL_LOGGING
-    INSTALL_LOGGING=${INSTALL_LOGGING:-S}
-    echo ""
-
-    # Kernel module blocking
-    echo -e "${COLOR_BOLD}[7] Bloqueio de Módulos de Kernel${COLOR_RESET} (reduz superfície de ataque)"
-    echo "    • Desabilita protocolos não utilizados: dccp, sctp, rds, tipc"
-    echo "    • Bloqueia filesystems raramente usados em servidores"
-    echo "    • Baixo risco, melhora postura de segurança (CIS Benchmark)"
-    echo "    • Tempo: ~5 segundos"
-    read -p "    Instalar? [S/n]: " INSTALL_MOD_BLOCK
-    INSTALL_MOD_BLOCK=${INSTALL_MOD_BLOCK:-S}
-    echo ""
-
     echo -e "${COLOR_GREEN}────────────────────────────────────────────────────────${COLOR_RESET}"
-    echo "Resumo de componentes opcionais:"
-    [[ "$INSTALL_UPGRADES" =~ ^[Ss]$ ]] && echo "  ✅ Unattended Upgrades" || echo "  ⏭️  Unattended Upgrades (pulado)"
-    [[ "$INSTALL_AUDITD" =~ ^[Ss]$ ]] && echo "  ✅ Auditd" || echo "  ⏭️  Auditd (pulado)"
-    [[ "$INSTALL_LOGGING" =~ ^[Ss]$ ]] && echo "  ✅ Logging Avançado" || echo "  ⏭️  Logging Avançado (pulado)"
-    [[ "$INSTALL_MOD_BLOCK" =~ ^[Ss]$ ]] && echo "  ✅ Bloqueio de Módulos de Kernel" || echo "  ⏭️  Bloqueio de Módulos (pulado)"
+    echo "  Usuário SSH:      $SSH_USER (porta 22, só via Tailscale)"
+    echo "  SWAP:             ${SWAP_SIZE} GB"
+    echo "  Tailscale:        $([ -n "$TS_AUTHKEY" ] && echo "auth key" || echo "login pelo navegador")"
+    echo "  80/443:           $([ "$CF_ONLY" = "S" ] && echo "somente Cloudflare" || echo "público")"
+    echo "  Docker:           $([ "$INSTALL_DOCKER" = "S" ] && echo "sim, com firewall DOCKER-USER" || echo "não")"
     echo -e "${COLOR_GREEN}────────────────────────────────────────────────────────${COLOR_RESET}"
-    echo ""
-    
-    log SUCCESS "Configuração interativa concluída!"
-    
-    # Salvar configuração em arquivo temporário para recuperação
-    cat > "${SCRIPT_DIR}/.startup-config" << EOF
-SSH_USER="${SSH_USER}"
-SSH_USER_PASS="${SSH_USER_PASS}"
-SSH_PORT="${SSH_PORT}"
-SWAP_SIZE="${SWAP_SIZE}"
-PUB_KEY="${PUB_KEY}"
-TAILSCALE_IPV4="${TAILSCALE_IPV4}"
-TAILSCALE_IPV6="${TAILSCALE_IPV6}"
-INSTALL_UPGRADES="${INSTALL_UPGRADES}"
-INSTALL_AUDITD="${INSTALL_AUDITD}"
-INSTALL_LOGGING="${INSTALL_LOGGING}"
-INSTALL_MOD_BLOCK="${INSTALL_MOD_BLOCK}"
-EOF
-    chmod 600 "${SCRIPT_DIR}/.startup-config"
+    read -r -p "Confirmar e iniciar? [S/n]: " go
+    [[ "${go:-S}" =~ ^[Ss]$ ]] || { log INFO "Cancelado. Nada foi alterado."; exit 0; }
+
+    save_config
 }
 
-# Carregar configuração se houver checkpoint
+# Grava só o que é necessário para retomar (sem senha, sem auth key), com escape seguro
+save_config() {
+    (
+        umask 077   # só neste subshell: o arquivo nasce com permissão 600
+        {
+            printf 'SSH_USER=%q\n' "$SSH_USER"
+            printf 'SWAP_SIZE=%q\n' "$SWAP_SIZE"
+            printf 'PUB_KEY=%q\n' "$PUB_KEY"
+            printf 'CF_ONLY=%q\n' "$CF_ONLY"
+            printf 'INSTALL_DOCKER=%q\n' "$INSTALL_DOCKER"
+            printf 'TAILSCALE_IPV4=%q\n' "$TAILSCALE_IPV4"
+            printf 'TAILSCALE_IPV6=%q\n' "$TAILSCALE_IPV6"
+        } > "$CONFIG_FILE"
+    )
+}
+
 load_config() {
-    if [ -f "${SCRIPT_DIR}/.startup-config" ]; then
-        source "${SCRIPT_DIR}/.startup-config"
-        log INFO "Configuração carregada do checkpoint"
+    if [ ! -f "$CONFIG_FILE" ]; then
+        log ERROR "Checkpoint existe mas $CONFIG_FILE não. Escolha 'Recomeçar do zero'."
+        exit 1
+    fi
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+    log INFO "Configuração anterior carregada (usuário: $SSH_USER)"
+    # A senha não é gravada: se o usuário ainda não foi configurado, pede de novo
+    if ! is_phase_completed "user"; then
+        log PHASE "Senha do usuário $SSH_USER"
+        prompt_password
     fi
 }
 
 # ════════════════════════════════════════════════════════
-# FASES DE INSTALAÇÃO
+# FASES
 # ════════════════════════════════════════════════════════
 
-phase_ubuntu_password() {
-    local PHASE="ubuntu_password"
-    if is_phase_completed "$PHASE"; then
-        log INFO "Fase '$PHASE' já concluída. Pulando..."
-        return 0
-    fi
-    
-    local phase_start=$(date +%s)
-    log PHASE "Fase 1/14: Configurar usuário SSH ($SSH_USER)"
-    
-    # Se não for root, criar/configurar usuário
-    if [ "$SSH_USER" != "root" ]; then
-        # Verificar se usuário já existe
-        if id "$SSH_USER" &>/dev/null; then
-            log INFO "Usuário $SSH_USER já existe - apenas atualizando senha"
-        else
-            log INFO "Criando usuário $SSH_USER..."
-            useradd -m -s /bin/bash -G sudo "$SSH_USER" 2>&1 | tee -a "$LOG_FILE"
-            log SUCCESS "Usuário $SSH_USER criado"
-        fi
-        
-        # Definir senha
-        echo "$SSH_USER:$SSH_USER_PASS" | chpasswd
-        log SUCCESS "Senha do usuário $SSH_USER definida"
+phase_user() {
+    if id "$SSH_USER" &>/dev/null; then
+        log INFO "Usuário $SSH_USER já existe — atualizando senha e grupo sudo"
+        usermod -aG sudo "$SSH_USER"
     else
-        log INFO "Usuário root selecionado - pulando criação de usuário"
+        useradd -m -s /bin/bash -G sudo "$SSH_USER"
+        log SUCCESS "Usuário $SSH_USER criado"
     fi
-    
-    local phase_end=$(date +%s)
-    local phase_duration=$((phase_end - phase_start))
-    log SUCCESS "Fase concluída em $(format_time $phase_duration) | Tempo total: $(get_elapsed_time)"
-    
-    mark_phase_completed "$PHASE"
-    show_progress
+    echo "$SSH_USER:$SSH_USER_PASS" | chpasswd
+    SSH_USER_PASS=""
+    log SUCCESS "Senha definida (sudo e console web)"
 }
 
 phase_timezone() {
-    local PHASE="timezone"
-    if is_phase_completed "$PHASE"; then
-        log INFO "Fase '$PHASE' já concluída. Pulando..."
-        return 0
-    fi
-    
-    local phase_start=$(date +%s)
-    log PHASE "Fase 2/14: Configurar timezone"
-    
-    timedatectl set-timezone 'America/Sao_Paulo' 2>&1 | tee -a "$LOG_FILE"
-    timedatectl set-ntp true 2>&1 | tee -a "$LOG_FILE"
-    
-    local phase_end=$(date +%s)
-    local phase_duration=$((phase_end - phase_start))
-    log SUCCESS "Fase concluída em $(format_time $phase_duration) | Tempo total: $(get_elapsed_time)"
-    
-    mark_phase_completed "$PHASE"
-    show_progress
+    timedatectl set-timezone 'America/Sao_Paulo'
+    timedatectl set-ntp true
+    log SUCCESS "Timezone America/Sao_Paulo + NTP"
 }
 
 phase_system_update() {
-    local PHASE="system_update"
-    if is_phase_completed "$PHASE"; then
-        log INFO "Fase '$PHASE' já concluída. Pulando..."
-        return 0
-    fi
-    
-    log PHASE "Fase 3/14: Atualizar sistema"
-    local phase_start=$(date +%s)
-    
-    # Limpar repositórios problemáticos antes de atualizar
-    log INFO "Verificando repositórios problemáticos..."
-    
-    # Remover repositórios Monarx problemáticos se existirem
-    if [ -f /etc/apt/sources.list.d/monarx.list ]; then
-        log WARNING "Removendo repositório Monarx problemático..."
-        rm -f /etc/apt/sources.list.d/monarx.list
-    fi
-    
-    # Desabilitar repositórios que causam erro 404
-    for file in /etc/apt/sources.list.d/*.list; do
-        if [ -f "$file" ] && grep -q "repository.monarx.com" "$file" 2>/dev/null; then
-            log WARNING "Desabilitando repositório problemático: $file"
-            mv "$file" "$file.disabled"
+    # Repositório da Monarx (agente da Hostinger) costuma quebrar o apt com 404
+    local f
+    for f in /etc/apt/sources.list.d/*; do
+        [ -f "$f" ] || continue
+        if grep -q "repository.monarx.com" "$f" 2>/dev/null; then
+            log WARNING "Desabilitando repositório Monarx: $f"
+            mv "$f" "$f.disabled"
         fi
     done
-    
-    # Tentar atualizar, se falhar por repositórios ruins, continuar mesmo assim
-    log INFO "Atualizando lista de pacotes..."
-    if ! apt update -y -qq >> "$LOG_FILE" 2>&1; then
-        log WARNING "apt update teve erros, mas continuando..."
-    fi
-    
-    log INFO "Atualizando pacotes do sistema (pode demorar)..."
-    DEBIAN_FRONTEND=noninteractive apt upgrade -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" >> "$LOG_FILE" 2>&1
-    
-    log INFO "Removendo pacotes desnecessários..."
-    apt autoremove -y -qq >> "$LOG_FILE" 2>&1
-    
-    log INFO "Limpando cache de pacotes..."
-    apt autoclean -y -qq >> "$LOG_FILE" 2>&1
-    
-    local phase_end=$(date +%s)
-    local phase_duration=$((phase_end - phase_start))
-    log SUCCESS "Fase concluída em $(format_time $phase_duration) | Tempo total: $(get_elapsed_time)"
-    
-    mark_phase_completed "$PHASE"
-    show_progress
+
+    log INFO "Atualizando pacotes (pode demorar)..."
+    "${APT_GET[@]}" update >> "$LOG_FILE" 2>&1
+    "${APT_GET[@]}" full-upgrade >> "$LOG_FILE" 2>&1
+    "${APT_GET[@]}" install curl ca-certificates gnupg ufw iptables >> "$LOG_FILE" 2>&1
+    "${APT_GET[@]}" autoremove --purge >> "$LOG_FILE" 2>&1
+    "${APT_GET[@]}" autoclean >> "$LOG_FILE" 2>&1
+    log SUCCESS "Sistema atualizado"
 }
 
 phase_unattended_upgrades() {
-    local PHASE="unattended_upgrades"
-    if is_phase_completed "$PHASE"; then
-        log INFO "Fase '$PHASE' já concluída. Pulando..."
-        return 0
-    fi
-    
-    log PHASE "Fase 4/14: Configurar atualizações automáticas de segurança"
-    local phase_start=$(date +%s)
-    
-    log INFO "Instalando unattended-upgrades..."
-    DEBIAN_FRONTEND=noninteractive apt install -y -qq unattended-upgrades apt-listchanges >> "$LOG_FILE" 2>&1
-    
-    # Configurar para instalar apenas updates de segurança
-    log INFO "Configurando atualizações automáticas..."
-    cat > /etc/apt/apt.conf.d/50unattended-upgrades << 'UNATTENDED_EOF'
-// Configuração de Atualizações Automáticas de Segurança
+    "${APT_GET[@]}" install unattended-upgrades update-notifier-common >> "$LOG_FILE" 2>&1
+
+    cat > /etc/apt/apt.conf.d/52unattended-upgrades-hardening << 'EOF'
+// Gerado por 01-startup.sh — apenas atualizações de SEGURANÇA, sem reboot automático
 Unattended-Upgrade::Allowed-Origins {
     "${distro_id}:${distro_codename}-security";
-    // "${distro_id}:${distro_codename}-updates";  // Descomente se quiser updates também
+    "${distro_id}ESMApps:${distro_codename}-apps-security";
+    "${distro_id}ESM:${distro_codename}-infra-security";
 };
-
-// Lista de pacotes que NÃO devem ser atualizados automaticamente
-Unattended-Upgrade::Package-Blacklist {
-    // "vim";
-    // "libc6";
-};
-
-// Remover automaticamente dependências não usadas
 Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
 Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
 Unattended-Upgrade::Remove-Unused-Dependencies "true";
-
-// Reiniciar automaticamente se necessário (DESABILITADO para segurança)
 Unattended-Upgrade::Automatic-Reboot "false";
-
-// Se reboot for necessário, criar arquivo avisando
-Unattended-Upgrade::Automatic-Reboot-WithUsers "false";
-
-// Logging
 Unattended-Upgrade::SyslogEnable "true";
-Unattended-Upgrade::SyslogFacility "daemon";
-UNATTENDED_EOF
-    
-    # Ativar atualizações automáticas
-    cat > /etc/apt/apt.conf.d/20auto-upgrades << 'AUTO_UPGRADES_EOF'
-// Habilitar atualizações automáticas
+EOF
+
+    cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Download-Upgradeable-Packages "1";
 APT::Periodic::AutocleanInterval "7";
 APT::Periodic::Unattended-Upgrade "1";
-AUTO_UPGRADES_EOF
-    
-    # Configurar sem interação
-    echo 'Dpkg::Options {"--force-confdef"; "--force-confold";}' > /etc/apt/apt.conf.d/99local
-    
-    # Verificar configuração
-    if systemctl is-enabled unattended-upgrades.service > /dev/null 2>&1 || \
-       systemctl list-timers 2>/dev/null | grep -q apt-daily-upgrade; then
-        log SUCCESS "Atualizações automáticas configuradas"
-        log SUCCESS "Apenas patches de segurança serão instalados automaticamente"
-        log SUCCESS "Reboot manual necessário se kernel for atualizado"
-    else
-        log WARNING "Unattended-upgrades instalado mas serviço não habilitado automaticamente"
-        log INFO "Será ativado no próximo boot"
-    fi
-    
-    local phase_end=$(date +%s)
-    local phase_duration=$((phase_end - phase_start))
-    log SUCCESS "Fase concluída em $(format_time $phase_duration) | Tempo total: $(get_elapsed_time)"
-    
-    mark_phase_completed "$PHASE"
-    show_progress
+EOF
+
+    systemctl enable --now unattended-upgrades >> "$LOG_FILE" 2>&1
+    log SUCCESS "Patches de segurança automáticos (o servidor NUNCA reinicia sozinho)"
+    log INFO "  • Quando precisar de reboot, o login SSH mostra: *** System restart required ***"
 }
 
-phase_kernel_security() {
-    local PHASE="kernel_security"
-    if is_phase_completed "$PHASE"; then
-        log INFO "Fase '$PHASE' já concluída. Pulando..."
-        return 0
-    fi
-    
-    log PHASE "Fase 5/14: Hardening do kernel"
-    local phase_start=$(date +%s)
-    
-    echo "kernel.randomize_va_space = 2" > /etc/sysctl.d/60-aslr.conf
-    echo "kernel.yama.ptrace_scope = 1" > /etc/sysctl.d/60-yama.conf
-    echo "* hard core 0" >> /etc/security/limits.conf
-    echo "fs.suid_dumpable = 0" > /etc/sysctl.d/60-coredump.conf
-    
-    sysctl --system 2>&1 | tee -a "$LOG_FILE"
-    
-    log SUCCESS "Segurança do kernel configurada (ASLR, ptrace, core dumps)"
-    
-    local phase_end=$(date +%s)
-    local phase_duration=$((phase_end - phase_start))
-    log SUCCESS "Fase concluída em $(format_time $phase_duration) | Tempo total: $(get_elapsed_time)"
-    
-    mark_phase_completed "$PHASE"
-    show_progress
-}
+phase_sysctl() {
+    cat > "$SYSCTL_FILE" << 'EOF'
+# Gerado por 01-startup.sh
+# Obs.: net.ipv4.ip_forward NÃO é definido aqui — Docker e Tailscale precisam dele = 1.
 
-phase_network_hardening() {
-    local PHASE="network_hardening"
-    if is_phase_completed "$PHASE"; then
-        log INFO "Fase '$PHASE' já concluída. Pulando..."
-        return 0
-    fi
-    
-    log PHASE "Fase 6/14: Hardening de rede + Performance tuning"
-    local phase_start=$(date +%s)
-    
-    log INFO "Configurando parâmetros de rede (segurança + performance)..."
-    
-    cat > /etc/sysctl.d/60-net.conf << 'NET_CONF'
-# ════════════════════════════════════════════════════════
-# Network Security Hardening
-# ════════════════════════════════════════════════════════
-net.ipv4.ip_forward = 0
-net.ipv4.conf.all.send_redirects = 0
-net.ipv4.conf.default.send_redirects = 0
+# ── Kernel ───────────────────────────────────────────────
+kernel.dmesg_restrict = 1           # só root lê o log do kernel
+kernel.kptr_restrict = 2            # esconde endereços do kernel
+fs.suid_dumpable = 0                # sem core dump de programas privilegiados
+
+# ── Rede: proteções ──────────────────────────────────────
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
 net.ipv6.conf.all.accept_redirects = 0
 net.ipv6.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv6.conf.all.accept_source_route = 0
+net.ipv6.conf.default.accept_source_route = 0
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
-net.ipv4.icmp_ignore_bogus_error_responses = 1
 net.ipv4.icmp_echo_ignore_broadcasts = 1
-net.ipv4.icmp_ratelimit = 100
+net.ipv4.icmp_ignore_bogus_error_responses = 1
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_rfc1337 = 1
-net.ipv4.tcp_timestamps = 0
 net.ipv4.tcp_synack_retries = 2
 
-# ════════════════════════════════════════════════════════
-# TCP Performance Tuning (APIs de alto tráfego)
-# ════════════════════════════════════════════════════════
-
-# Connection queue (essencial para múltiplas conexões simultâneas)
+# ── Rede: desempenho (proxy reverso / APIs) ──────────────
 net.core.somaxconn = 4096
 net.ipv4.tcp_max_syn_backlog = 8192
-
-# TCP buffers (melhor throughput em conexões rápidas)
 net.core.rmem_max = 16777216
 net.core.wmem_max = 16777216
 net.ipv4.tcp_rmem = 4096 87380 16777216
 net.ipv4.tcp_wmem = 4096 65536 16777216
-
-# Reuso de sockets (previne esgotamento de portas)
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_max_tw_buckets = 400000
-
-# TCP Fast Open (reduz latência)
 net.ipv4.tcp_fastopen = 3
-
-# Keepalive otimizado
 net.ipv4.tcp_keepalive_time = 600
 net.ipv4.tcp_keepalive_intvl = 10
 net.ipv4.tcp_keepalive_probes = 6
+net.ipv4.ip_local_port_range = 10240 65535
 
-# ════════════════════════════════════════════════════════
-# File Descriptor Limits (suporta 1M+ conexões)
-# ════════════════════════════════════════════════════════
+# ── Arquivos, inotify e memória ──────────────────────────
 fs.file-max = 2097152
 fs.nr_open = 2097152
-NET_CONF
-    
-    sysctl -p /etc/sysctl.d/60-net.conf 2>&1 | tee -a "$LOG_FILE"
-    
-    # Configurar BBR se disponível
-    log INFO "Verificando suporte a BBR congestion control..."
+fs.inotify.max_user_watches = 524288
+fs.inotify.max_user_instances = 1024
+vm.swappiness = 10
+EOF
+
+    # BBR (carregado no boot antes do sysctl)
     if modprobe tcp_bbr 2>/dev/null; then
-        echo "net.core.default_qdisc = fq" >> /etc/sysctl.d/60-net.conf
-        echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.d/60-net.conf
-        sysctl -p /etc/sysctl.d/60-net.conf 2>&1 | tee -a "$LOG_FILE"
-        log SUCCESS "BBR congestion control ativado (throughput 2-25x melhor)"
+        echo "tcp_bbr" > /etc/modules-load.d/tcp_bbr.conf
+        printf '\n# ── Controle de congestionamento ──\nnet.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\n' >> "$SYSCTL_FILE"
+        log SUCCESS "BBR ativado"
     else
-        log WARNING "BBR não disponível (kernel < 4.9) - usando CUBIC"
+        log WARNING "BBR indisponível neste kernel — mantendo padrão"
     fi
-    
-    # Garantir que nf_conntrack carrega no boot ANTES do sysctl
-    log INFO "Configurando nf_conntrack para carregar no boot..."
+
+    # Conntrack (tabela grande e timeouts curtos contra flood de conexões)
     echo "nf_conntrack" > /etc/modules-load.d/nf_conntrack.conf
     modprobe nf_conntrack 2>/dev/null || true
-
-    # Configurar conntrack (Camada 3 — proteção contra DDoS por esgotamento de tabela)
-    log INFO "Configurando conntrack (nf_conntrack)..."
-    if [ -d /proc/sys/net/netfilter ]; then
-        cat > /etc/sysctl.d/60-conntrack.conf << 'CONNTRACK_CONF'
-# ════════════════════════════════════════════════════════
-# Conntrack — Proteção contra DDoS por flood de conexões
-# ════════════════════════════════════════════════════════
-# Tabela pode suportar 1M conexões simultâneas
+    cat > /etc/sysctl.d/91-conntrack.conf << 'EOF'
+# Gerado por 01-startup.sh
 net.netfilter.nf_conntrack_max = 1048576
-# Conexões estabelecidas: expiram em 24h
 net.netfilter.nf_conntrack_tcp_timeout_established = 86400
-# SYN_RECV: reduzido para 15s (mitiga SYN flood)
 net.netfilter.nf_conntrack_tcp_timeout_syn_recv = 15
-# TIME_WAIT: reduzido para liberar slots mais rápido
 net.netfilter.nf_conntrack_tcp_timeout_time_wait = 15
-# CLOSE_WAIT: reduzido para 30s
 net.netfilter.nf_conntrack_tcp_timeout_close_wait = 30
-CONNTRACK_CONF
-        sysctl -p /etc/sysctl.d/60-conntrack.conf 2>&1 | tee -a "$LOG_FILE"
-        log SUCCESS "Conntrack configurado:"
-        log SUCCESS "  • Tabela: 1M conexões simultâneas"
-        log SUCCESS "  • Timeouts reduzidos: syn_recv=15s, time_wait=15s, close_wait=30s"
-    else
-        log WARNING "nf_conntrack não disponível agora — será ativado após reboot"
-    fi
+EOF
 
-    # Configurar file descriptor limits (user level)
+    sysctl --system >> "$LOG_FILE" 2>&1
 
-    # /etc/security/limits.conf
-    if ! grep -q "^* soft nofile 1048576" /etc/security/limits.conf 2>/dev/null; then
-        cat >> /etc/security/limits.conf << 'LIMITS_EOF'
-
-# File descriptor limits (hardening script)
-* soft nofile 1048576
-* hard nofile 1048576
+    # Limites: core dump desligado e 1M de file descriptors
+    cat > /etc/security/limits.d/90-hardening.conf << 'EOF'
+# Gerado por 01-startup.sh
+*    hard core   0
+*    soft nofile 1048576
+*    hard nofile 1048576
 root soft nofile 1048576
 root hard nofile 1048576
-LIMITS_EOF
-        log SUCCESS "Limits.conf configurado (1M file descriptors)"
-    else
-        log INFO "Limits.conf já configurado"
-    fi
-    
-    # /etc/systemd/system.conf
-    if [ -f /etc/systemd/system.conf ]; then
-        if ! grep -q "^DefaultLimitNOFILE=1048576" /etc/systemd/system.conf 2>/dev/null; then
-            sed -i 's/^#*DefaultLimitNOFILE=.*/DefaultLimitNOFILE=1048576/' /etc/systemd/system.conf
-            log SUCCESS "Systemd system.conf configurado (1M file descriptors)"
-        else
-            log INFO "Systemd system.conf já configurado"
-        fi
-    fi
-    
-    # /etc/systemd/user.conf
-    if [ -f /etc/systemd/user.conf ]; then
-        if ! grep -q "^DefaultLimitNOFILE=1048576" /etc/systemd/user.conf 2>/dev/null; then
-            sed -i 's/^#*DefaultLimitNOFILE=.*/DefaultLimitNOFILE=1048576/' /etc/systemd/user.conf
-            log SUCCESS "Systemd user.conf configurado (1M file descriptors)"
-        else
-            log INFO "Systemd user.conf já configurado"
-        fi
-    fi
-    
-    # Recarregar systemd
-    systemctl daemon-reexec 2>&1 | tee -a "$LOG_FILE"
-    
-    log SUCCESS "Hardening de rede configurado:"
-    log SUCCESS "  • Segurança: SYN cookies, ICMP, redirects bloqueados"
-    log SUCCESS "  • Performance: somaxconn=4096, buffers=16MB, tw_reuse"
-    log SUCCESS "  • File descriptors: 1M (suporta APIs de alto tráfego)"
-    
-    local phase_end=$(date +%s)
-    local phase_duration=$((phase_end - phase_start))
-    log SUCCESS "Fase concluída em $(format_time $phase_duration) | Tempo total: $(get_elapsed_time)"
-    
-    mark_phase_completed "$PHASE"
-    show_progress
+EOF
+    mkdir -p /etc/systemd/system.conf.d
+    printf '[Manager]\nDefaultLimitNOFILE=1048576\n' > /etc/systemd/system.conf.d/90-nofile.conf
+    systemctl daemon-reexec
+
+    log SUCCESS "Sysctl aplicado: $SYSCTL_FILE"
+}
+
+phase_kernel_modules() {
+    cat > /etc/modprobe.d/blacklist-hardening.conf << 'EOF'
+# Gerado por 01-startup.sh — módulos sem uso em servidor (CIS Benchmark)
+# Protocolos de rede
+install dccp /bin/false
+install sctp /bin/false
+install rds /bin/false
+install tipc /bin/false
+blacklist dccp
+blacklist sctp
+blacklist rds
+blacklist tipc
+# Sistemas de arquivos
+install cramfs /bin/false
+install freevxfs /bin/false
+install jffs2 /bin/false
+install hfs /bin/false
+install hfsplus /bin/false
+install udf /bin/false
+blacklist cramfs
+blacklist freevxfs
+blacklist jffs2
+blacklist hfs
+blacklist hfsplus
+blacklist udf
+EOF
+    update-initramfs -u >> "$LOG_FILE" 2>&1 || log WARNING "update-initramfs falhou (efeito vale no próximo boot mesmo assim)"
+    log SUCCESS "Módulos bloqueados: dccp, sctp, rds, tipc, cramfs, freevxfs, jffs2, hfs, hfsplus, udf"
 }
 
 phase_swap() {
-    local PHASE="swap"
-    if is_phase_completed "$PHASE"; then
-        log INFO "Fase '$PHASE' já concluída. Pulando..."
-        return 0
-    fi
-    
-    log PHASE "Fase 7/14: Configurar SWAP"
-    local phase_start=$(date +%s)
-    
-    SWAPFILE="/swap/swapfile"
-    
-    # Verificar se já existe SWAP ativo
-    if swapon --show | grep -q "/"; then
-        log WARNING "SWAP já ativo detectado:"
+    local swapfile="/swap/swapfile"
+
+    # Remove swaps existentes (arquivo da imagem da VPS, swap antigo etc.)
+    if [ -n "$(swapon --show --noheadings)" ]; then
+        log INFO "Desativando swap existente:"
         swapon --show | tee -a "$LOG_FILE"
-        
-        # Desativar todos os swaps ativos
-        log INFO "Desativando swaps existentes..."
-        swapoff -a
-        
-        # Remover entradas antigas do fstab
-        log INFO "Limpando entradas antigas de swap do fstab..."
-        sed -i.bak '/swap/d' /etc/fstab
+        local old
+        for old in $(swapon --show=NAME --noheadings); do
+            swapoff "$old"
+            [ -f "$old" ] && rm -f "$old"
+        done
     fi
-    
-    # Remover arquivo de swap antigo se existir
-    if [ -f "$SWAPFILE" ]; then
-        log INFO "Removendo arquivo de swap antigo..."
-        rm -f "$SWAPFILE"
-    fi
-    
-    # Criar novo swap
-    log INFO "Criando novo SWAP de ${SWAP_SIZE}GB..."
+    cp /etc/fstab "/etc/fstab.bak.$(date +%Y%m%d_%H%M%S)"
+    awk '$3 != "swap"' /etc/fstab > /etc/fstab.new && mv /etc/fstab.new /etc/fstab
+
     mkdir -p /swap
-    dd if=/dev/zero of=$SWAPFILE bs=1M count=$((SWAP_SIZE * 1024)) >> "$LOG_FILE" 2>&1
-    chmod 600 $SWAPFILE
-    mkswap $SWAPFILE >> "$LOG_FILE" 2>&1
-    swapon $SWAPFILE
-    
-    # Adicionar ao fstab
-    echo "$SWAPFILE swap swap defaults 0 0" >> /etc/fstab
-    
-    # Verificar
-    if swapon --show | grep -q "$SWAPFILE"; then
-        log SUCCESS "SWAP de ${SWAP_SIZE}GB criado e ativado"
-        log SUCCESS "Localização: $SWAPFILE"
-    else
-        log ERROR "Falha ao ativar SWAP!"
+    rm -f "$swapfile"
+    if ! fallocate -l "${SWAP_SIZE}G" "$swapfile" 2>/dev/null; then
+        dd if=/dev/zero of="$swapfile" bs=1M count=$((SWAP_SIZE * 1024)) status=none
+    fi
+    chmod 600 "$swapfile"
+    mkswap "$swapfile" >> "$LOG_FILE" 2>&1
+    swapon "$swapfile"
+    echo "$swapfile none swap sw 0 0" >> /etc/fstab
+
+    if [[ "$(swapon --show=NAME --noheadings)" != *"$swapfile"* ]]; then
+        log ERROR "SWAP não ativou"
         exit 1
     fi
-    
-    local phase_end=$(date +%s)
-    local phase_duration=$((phase_end - phase_start))
-    log SUCCESS "Fase concluída em $(format_time $phase_duration) | Tempo total: $(get_elapsed_time)"
-    
-    mark_phase_completed "$PHASE"
-    show_progress
+    log SUCCESS "SWAP de ${SWAP_SIZE} GB ativo em $swapfile (swappiness=10)"
 }
 
 phase_ssh_key() {
-    local PHASE="ssh_key"
-    if is_phase_completed "$PHASE"; then
-        log INFO "Fase '$PHASE' já concluída. Pulando..."
-        return 0
-    fi
-    
-    log PHASE "Fase 8/14: Configurar chave SSH"
-    local phase_start=$(date +%s)
-    
-    # Configurar chave SSH para o usuário correto
-    if [ "$SSH_USER" = "root" ]; then
-        SSH_HOME="/root"
-    else
-        SSH_HOME="/home/$SSH_USER"
-    fi
-    
-    mkdir -p "$SSH_HOME/.ssh"
-    chmod 700 "$SSH_HOME/.ssh"
-    echo "$PUB_KEY" > "$SSH_HOME/.ssh/authorized_keys"
-    chmod 600 "$SSH_HOME/.ssh/authorized_keys"
-    
-    if [ "$SSH_USER" != "root" ]; then
-        chown -R "$SSH_USER:$SSH_USER" "$SSH_HOME/.ssh"
-    fi
-    
-    log SUCCESS "Chave SSH configurada para usuário $SSH_USER"
-    
-    local phase_end=$(date +%s)
-    local phase_duration=$((phase_end - phase_start))
-    log SUCCESS "Fase concluída em $(format_time $phase_duration) | Tempo total: $(get_elapsed_time)"
-    
-    mark_phase_completed "$PHASE"
-    show_progress
+    local home
+    home=$(getent passwd "$SSH_USER" | cut -d: -f6)
+    install -d -m 700 -o "$SSH_USER" -g "$SSH_USER" "$home/.ssh"
+    echo "$PUB_KEY" > "$home/.ssh/authorized_keys"
+    chmod 600 "$home/.ssh/authorized_keys"
+    chown "$SSH_USER:$SSH_USER" "$home/.ssh/authorized_keys"
+    log SUCCESS "Chave instalada em $home/.ssh/authorized_keys"
 }
 
 phase_tailscale() {
-    local PHASE="tailscale"
-    if is_phase_completed "$PHASE"; then
-        log INFO "Fase '$PHASE' já concluída. Pulando..."
-        return 0
+    if ! command -v tailscale &>/dev/null; then
+        log INFO "Instalando Tailscale (script oficial, repositório apt assinado)..."
+        curl -fsSL https://tailscale.com/install.sh | sh >> "$LOG_FILE" 2>&1
     fi
-    
-    log PHASE "Fase 9/14: Instalar e configurar Tailscale VPN"
-    local phase_start=$(date +%s)
-    
-    log INFO "Baixando e instalando Tailscale..."
-    if curl -fsSL https://tailscale.com/install.sh | sh 2>&1 | tee -a "$LOG_FILE"; then
-        log SUCCESS "Tailscale instalado com sucesso"
-    else
-        log ERROR "Falha ao instalar Tailscale"
+    systemctl enable --now tailscaled >> "$LOG_FILE" 2>&1
+
+    if [ -z "$(tailscale ip -4 2>/dev/null || true)" ]; then
+        if [ -n "$TS_AUTHKEY" ]; then
+            log INFO "Conectando com auth key..."
+            tailscale up --auth-key="$TS_AUTHKEY" --hostname="$(hostname -s)" 2>&1 | tee -a "$LOG_FILE"
+        else
+            echo ""
+            echo -e "${COLOR_BOLD}${COLOR_YELLOW}  ⚠️  AÇÃO NECESSÁRIA: abra o link abaixo no navegador para autenticar${COLOR_RESET}"
+            echo ""
+            tailscale up --hostname="$(hostname -s)" 2>&1 | tee -a "$LOG_FILE"
+        fi
+    fi
+    TS_AUTHKEY=""
+
+    local i
+    for i in $(seq 1 30); do
+        TAILSCALE_IPV4=$(tailscale ip -4 2>/dev/null | head -n1 || true)
+        [ -n "$TAILSCALE_IPV4" ] && break
+        sleep 1
+    done
+    if [ -z "$TAILSCALE_IPV4" ]; then
+        log ERROR "Tailscale não conectou. Rode 'tailscale up' e depois este script de novo."
         exit 1
     fi
-    
-    log INFO "Iniciando Tailscale..."
+    TAILSCALE_IPV6=$(tailscale ip -6 2>/dev/null | head -n1 || true)
+    save_config
+    log SUCCESS "Tailscale conectado: $TAILSCALE_IPV4 ${TAILSCALE_IPV6}"
+
+    # Sem isso o servidor sai da rede em ~180 dias e o SSH fica inacessível
     echo ""
     echo -e "${COLOR_BOLD}${COLOR_YELLOW}════════════════════════════════════════════════════════${COLOR_RESET}"
-    echo -e "${COLOR_BOLD}${COLOR_YELLOW}  ⚠️  AÇÃO NECESSÁRIA: Autenticação Tailscale${COLOR_RESET}"
+    echo -e "${COLOR_BOLD}${COLOR_YELLOW}  ⚠️  OBRIGATÓRIO: desativar a expiração da chave deste servidor${COLOR_RESET}"
     echo -e "${COLOR_BOLD}${COLOR_YELLOW}════════════════════════════════════════════════════════${COLOR_RESET}"
+    echo "  O SSH só vai funcionar pelo Tailscale. Se a chave expirar, você perde o acesso."
     echo ""
-    echo "O Tailscale irá gerar uma URL de autenticação."
-    echo "Você deve abrir essa URL no seu navegador para autenticar este servidor."
+    echo "  1. Abra: https://login.tailscale.com/admin/machines"
+    echo "  2. Na máquina '$(hostname -s)' clique em '...' → 'Disable key expiry'"
     echo ""
-    echo -e "${COLOR_CYAN}Iniciando Tailscale...${COLOR_RESET}"
-    echo ""
-    
-    # Executar tailscale up e capturar output
-    tailscale up 2>&1 | tee -a "$LOG_FILE"
-    
-    echo ""
-    echo -e "${COLOR_BOLD}${COLOR_GREEN}════════════════════════════════════════════════════════${COLOR_RESET}"
-    echo -e "${COLOR_BOLD}${COLOR_GREEN}  Aguardando autenticação...${COLOR_RESET}"
-    echo -e "${COLOR_BOLD}${COLOR_GREEN}════════════════════════════════════════════════════════${COLOR_RESET}"
-    echo ""
-    echo "Após autenticar no navegador, pressione ENTER para continuar..."
-    read -p ""
-    
-    # Verificar se está conectado e capturar IPs
-    if tailscale status &>/dev/null; then
-        log SUCCESS "Tailscale conectado com sucesso!"
-        echo ""
-        log INFO "Endereços IP do Tailscale:"
-        tailscale ip 2>&1 | tee -a "$LOG_FILE"
-        
-        # Capturar IPs do Tailscale para uso posterior no SSH
-        TAILSCALE_IPV4=$(tailscale ip -4 2>/dev/null | head -n1)
-        TAILSCALE_IPV6=$(tailscale ip -6 2>/dev/null | head -n1)
-        
-        if [ -n "$TAILSCALE_IPV4" ]; then
-            log SUCCESS "IPv4 Tailscale capturado: $TAILSCALE_IPV4"
-            
-            # Salvar IP do Tailscale no config para usar em outras fases
-            if [ -f "${SCRIPT_DIR}/.startup-config" ]; then
-                sed -i "s|TAILSCALE_IPV4=\".*\"|TAILSCALE_IPV4=\"$TAILSCALE_IPV4\"|" "${SCRIPT_DIR}/.startup-config"
-            fi
-        fi
-        if [ -n "$TAILSCALE_IPV6" ]; then
-            log SUCCESS "IPv6 Tailscale capturado: $TAILSCALE_IPV6"
-            
-            # Salvar IP do Tailscale no config
-            if [ -f "${SCRIPT_DIR}/.startup-config" ]; then
-                sed -i "s|TAILSCALE_IPV6=\".*\"|TAILSCALE_IPV6=\"$TAILSCALE_IPV6\"|" "${SCRIPT_DIR}/.startup-config"
-            fi
-        fi
-        
-        echo ""
-        log INFO "Status do Tailscale:"
-        tailscale status 2>&1 | tee -a "$LOG_FILE"
-    else
-        log WARNING "Tailscale instalado mas não conectado. Você pode conectar depois com: sudo tailscale up"
-        log ERROR "SSH requer IPs do Tailscale. Execute 'tailscale up' manualmente e rode o script novamente."
-        exit 1
-    fi
-    
-    local phase_end=$(date +%s)
-    local phase_duration=$((phase_end - phase_start))
-    log SUCCESS "Fase concluída em $(format_time $phase_duration) | Tempo total: $(get_elapsed_time)"
-    
-    mark_phase_completed "$PHASE"
-    show_progress
+    local done_expiry
+    while true; do
+        read -r -p "  Já desativou? Digite 'ok' para continuar: " done_expiry
+        [ "$done_expiry" = "ok" ] && break
+    done
+    log SUCCESS "Expiração da chave Tailscale desativada (confirmado pelo usuário)"
 }
 
 phase_ssh_config() {
-    local PHASE="ssh_config"
-    if is_phase_completed "$PHASE"; then
-        log INFO "Fase '$PHASE' já concluída. Pulando..."
-        return 0
-    fi
-    
-    log PHASE "Fase 10/14: Configurar SSH com segurança (acesso apenas via Tailscale)"
-    local phase_start=$(date +%s)
-    
-    # Verificar se temos IP do Tailscale
     if [ -z "$TAILSCALE_IPV4" ]; then
-        log ERROR "IP do Tailscale não encontrado! Carregando do config..."
-        load_config
-        
-        if [ -z "$TAILSCALE_IPV4" ]; then
-            log ERROR "Não foi possível obter IP do Tailscale. Execute a fase do Tailscale primeiro."
-            exit 1
-        fi
+        log ERROR "IP do Tailscale desconhecido. Rode a fase do Tailscale primeiro."
+        exit 1
     fi
-    
-    # Backup
-    cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)
-    
-    # CORREÇÃO CRÍTICA: Desabilitar arquivos cloud-init que sobrescrevem configurações
-    log INFO "Desabilitando arquivos cloud-init que sobrescrevem SSH..."
-    if [ -f /etc/ssh/sshd_config.d/50-cloud-init.conf ]; then
-        log WARNING "Encontrado 50-cloud-init.conf - desabilitando..."
-        mv /etc/ssh/sshd_config.d/50-cloud-init.conf /etc/ssh/sshd_config.d/50-cloud-init.conf.disabled 2>&1 | tee -a "$LOG_FILE"
-    fi
-    
-    if [ -f /etc/ssh/sshd_config.d/60-cloudimg-settings.conf ]; then
-        log WARNING "Encontrado 60-cloudimg-settings.conf - desabilitando..."
-        mv /etc/ssh/sshd_config.d/60-cloudimg-settings.conf /etc/ssh/sshd_config.d/60-cloudimg-settings.conf.disabled 2>&1 | tee -a "$LOG_FILE"
-    fi
-    
-    log INFO "Removendo configurações inseguras antigas..."
-    
-    # REMOVER COMPLETAMENTE (deletar) as configurações antigas
-    sed -i '/^PermitRootLogin/d' /etc/ssh/sshd_config
-    sed -i '/^PasswordAuthentication/d' /etc/ssh/sshd_config
-    sed -i '/^ChallengeResponseAuthentication/d' /etc/ssh/sshd_config
-    sed -i '/^PubkeyAuthentication/d' /etc/ssh/sshd_config
-    sed -i '/^Port /d' /etc/ssh/sshd_config
-    sed -i '/^AllowUsers/d' /etc/ssh/sshd_config
-    sed -i '/^PermitEmptyPasswords/d' /etc/ssh/sshd_config
-    sed -i '/^UsePAM/d' /etc/ssh/sshd_config
-    sed -i '/^ListenAddress/d' /etc/ssh/sshd_config
-    
-    # Remover também linhas comentadas antigas
-    sed -i '/^#PermitRootLogin/d' /etc/ssh/sshd_config
-    sed -i '/^#PasswordAuthentication/d' /etc/ssh/sshd_config
-    sed -i '/^#ChallengeResponseAuthentication/d' /etc/ssh/sshd_config
-    sed -i '/^#PubkeyAuthentication/d' /etc/ssh/sshd_config
-    
-    log SUCCESS "Configurações antigas removidas"
-    
-    # Adicionar configurações seguras (agora serão as ÚNICAS presentes)
-    log INFO "Adicionando configurações seguras..."
-    tee -a /etc/ssh/sshd_config > /dev/null << EOF_SSH_CONFIG
 
-# ════════════════════════════════════════════════════════
-# Security Hardening Configuration - $(date +%Y-%m-%d)
-# ════════════════════════════════════════════════════════
-# ATENÇÃO: Estas são as ÚNICAS configurações de autenticação ativas
-# Todas as anteriores foram REMOVIDAS para evitar conflitos
-# SSH acessível APENAS via Tailscale VPN
-# ════════════════════════════════════════════════════════
+    local backup_dir
+    backup_dir="/root/ssh-backup-$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$backup_dir"
+    cp -a /etc/ssh/sshd_config /etc/ssh/sshd_config.d "$backup_dir/"
+    log INFO "Backup da configuração SSH: $backup_dir"
 
-# Listen only on Tailscale IPs (máxima segurança)
-# SSH acessível APENAS via Tailscale VPN
+    ssh-keygen -A >> "$LOG_FILE" 2>&1
+
+    # Outros arquivos em sshd_config.d (cloud-init, imagem da VPS) podem reabilitar senha
+    local f
+    for f in /etc/ssh/sshd_config.d/*.conf; do
+        [ -e "$f" ] || continue
+        [ "$f" = "$SSHD_DROPIN" ] && continue
+        log WARNING "Desabilitando $(basename "$f")"
+        mv "$f" "$f.disabled"
+    done
+    # Port/ListenAddress no arquivo principal se somariam aos nossos
+    sed -i -E 's/^[[:space:]]*(Port|ListenAddress)[[:space:]]/# desabilitado por 01-startup.sh: &/' /etc/ssh/sshd_config
+
+    # Kex pós-quântico quando o OpenSSH suporta (10.x: mlkem; 9.x: sntrup)
+    local supported kex="" k
+    supported=$(ssh -Q kex)
+    for k in mlkem768x25519-sha256 sntrup761x25519-sha512 sntrup761x25519-sha512@openssh.com \
+             curve25519-sha256 curve25519-sha256@libssh.org; do
+        grep -qx "$k" <<< "$supported" && kex="${kex:+$kex,}$k"
+    done
+
+    cat > "$SSHD_DROPIN" << EOF
+# Gerado por 01-startup.sh em $(date '+%Y-%m-%d %H:%M')
+# SSH acessível APENAS via Tailscale, apenas com chave.
+# Este arquivo é lido antes de qualquer outro (prefixo 00): os valores daqui prevalecem.
+
+Port $SSH_PORT
 ListenAddress 127.0.0.1
 ListenAddress $TAILSCALE_IPV4
-$([ -n "$TAILSCALE_IPV6" ] && echo "ListenAddress $TAILSCALE_IPV6" || echo "")
+$([ -n "$TAILSCALE_IPV6" ] && echo "ListenAddress $TAILSCALE_IPV6")
 
-# Port and Protocol
-Port $SSH_PORT
-Protocol 2
-AddressFamily any
-
-# Authentication (FORÇA apenas chave pública)
+# Autenticação
+PermitRootLogin no
+AllowUsers $SSH_USER
+AuthenticationMethods publickey
 PubkeyAuthentication yes
 PasswordAuthentication no
-ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
 PermitEmptyPasswords no
 UsePAM yes
 
-# Root access configuration
-$(if [ "$SSH_USER" = "root" ]; then echo "PermitRootLogin prohibit-password"; else echo "PermitRootLogin no"; fi)
-AllowUsers $SSH_USER
-
-# Security limits
+# Limites
 LoginGraceTime 30
 MaxAuthTries 3
-MaxSessions 2
+MaxSessions 10
 MaxStartups 10:30:60
-
-# Timeouts
 ClientAliveInterval 300
 ClientAliveCountMax 2
-TCPKeepAlive no
 
-# Disable unnecessary features
+# Recursos
 X11Forwarding no
 PermitUserEnvironment no
 AllowAgentForwarding yes
@@ -1061,525 +757,396 @@ AllowTcpForwarding yes
 GatewayPorts no
 PermitTunnel no
 
-# Logging
-SyslogFacility AUTH
-LogLevel VERBOSE
-
-# Strong crypto only
-KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group-exchange-sha256
-Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
-MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256
-
-# Host keys
+# Criptografia
 HostKey /etc/ssh/ssh_host_ed25519_key
-HostKey /etc/ssh/ssh_host_rsa_key
+KexAlgorithms $kex
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
 
-# Banner
-PrintMotd no
-PrintLastLog yes
-Compression yes
-EOF_SSH_CONFIG
-    
-    # Validar configuração
-    log INFO "Validando configuração SSH..."
-    if sshd -t 2>&1 | tee -a "$LOG_FILE"; then
-        log SUCCESS "Configuração SSH validada"
-        
-        # Verificar se as configurações críticas estão presentes
-        log INFO "Verificando configurações críticas..."
-        
-        # Validar PermitRootLogin baseado no usuário escolhido
-        if [ "$SSH_USER" = "root" ]; then
-            if ! grep -q "^PermitRootLogin prohibit-password" /etc/ssh/sshd_config; then
-                log ERROR "ERRO: PermitRootLogin prohibit-password não encontrado no arquivo!"
-                echo "Linhas com PermitRootLogin:" | tee -a "$LOG_FILE"
-                grep "PermitRootLogin" /etc/ssh/sshd_config | tee -a "$LOG_FILE"
-                exit 1
-            fi
-        else
-            if ! grep -q "^PermitRootLogin no" /etc/ssh/sshd_config; then
-                log ERROR "ERRO: PermitRootLogin no não encontrado no arquivo!"
-                echo "Linhas com PermitRootLogin:" | tee -a "$LOG_FILE"
-                grep "PermitRootLogin" /etc/ssh/sshd_config | tee -a "$LOG_FILE"
-                exit 1
-            fi
+LogLevel VERBOSE
+EOF
+    chmod 644 "$SSHD_DROPIN"
+
+    rollback_ssh() {
+        log ERROR "Restaurando configuração SSH anterior..."
+        rm -f "$SSHD_DROPIN"
+        rm -rf /etc/ssh/sshd_config.d
+        cp -a "$backup_dir/sshd_config.d" /etc/ssh/
+        cp -a "$backup_dir/sshd_config" /etc/ssh/sshd_config
+        restart_ssh || true
+    }
+
+    restart_ssh() {
+        systemctl daemon-reload
+        if systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
+            systemctl restart ssh.socket          # Ubuntu 24.04+: socket activation
         fi
-        
-        if ! grep -q "^PasswordAuthentication no" /etc/ssh/sshd_config; then
-            log ERROR "ERRO: PasswordAuthentication no não encontrado no arquivo!"
-            echo "Linhas com PasswordAuthentication:" | tee -a "$LOG_FILE"
-            grep "PasswordAuthentication" /etc/ssh/sshd_config | tee -a "$LOG_FILE"
-            exit 1
-        fi
-        
-        if ! grep -q "^AllowUsers $SSH_USER" /etc/ssh/sshd_config; then
-            log ERROR "ERRO: AllowUsers $SSH_USER não encontrado no arquivo!"
-            echo "Linhas com AllowUsers:" | tee -a "$LOG_FILE"
-            grep "AllowUsers" /etc/ssh/sshd_config | tee -a "$LOG_FILE"
-            exit 1
-        fi
-        
-        log WARNING "⚠️  ATENÇÃO: SSH será reiniciado na porta $SSH_PORT"
-        log WARNING "⚠️  SSH acessível APENAS via Tailscale: $TAILSCALE_IPV4"
-        
-        # Mostrar configurações críticas aplicadas
-        if [ "$SSH_USER" = "root" ]; then
-            log SUCCESS "✅ PermitRootLogin prohibit-password (apenas chave SSH)"
-        else
-            log SUCCESS "✅ PermitRootLogin no"
-        fi
-        log SUCCESS "✅ PasswordAuthentication no"
-        log SUCCESS "✅ AllowUsers $SSH_USER"
-        log SUCCESS "✅ ListenAddress $TAILSCALE_IPV4 (apenas Tailscale)"
-        
-        # Reiniciar SSH (tentar ambos os nomes de serviço)
-        systemctl restart sshd 2>&1 | tee -a "$LOG_FILE" || systemctl restart ssh 2>&1 | tee -a "$LOG_FILE"
+        systemctl restart ssh.service 2>/dev/null || true
         sleep 2
-        
-        # Verificar se SSH está rodando
-        if systemctl is-active --quiet sshd || systemctl is-active --quiet ssh; then
-            log SUCCESS "✅ SSH reiniciado e ativo"
-        else
-            log ERROR "❌ SSH não está rodando! Restaurando backup..."
-            cp /etc/ssh/sshd_config.backup.* /etc/ssh/sshd_config
-            systemctl restart sshd || systemctl restart ssh
-            exit 1
-        fi
-        
-        log SUCCESS "SSH configurado (porta $SSH_PORT)"
-        log SUCCESS "Acesso: ssh $SSH_USER@$TAILSCALE_IPV4 -p $SSH_PORT"
-        if [ "$SSH_USER" = "root" ]; then
-            log SUCCESS "Root login: PERMITIDO apenas com chave SSH"
-        else
-            log SUCCESS "Root login: BLOQUEADO"
-        fi
-        log SUCCESS "Password auth: DESABILITADO"
-        log SUCCESS "Apenas chave pública para usuário '$SSH_USER'"
-    else
-        log ERROR "Erro na configuração SSH. Restaurando backup..."
-        cp /etc/ssh/sshd_config.backup.* /etc/ssh/sshd_config
-        systemctl restart sshd || systemctl restart ssh
+    }
+
+    if ! sshd -t >> "$LOG_FILE" 2>&1; then
+        sshd -t || true
+        rollback_ssh
         exit 1
     fi
-    
-    local phase_end=$(date +%s)
-    local phase_duration=$((phase_end - phase_start))
-    log SUCCESS "Fase concluída em $(format_time $phase_duration) | Tempo total: $(get_elapsed_time)"
-    
-    mark_phase_completed "$PHASE"
-    show_progress
+
+    # Confere a configuração EFETIVA (não só o texto do arquivo)
+    local eff
+    eff=$(sshd -T 2>/dev/null)
+    local expect
+    for expect in "passwordauthentication no" "permitrootlogin no" "kbdinteractiveauthentication no" \
+                  "pubkeyauthentication yes" "allowusers $SSH_USER" "listenaddress $TAILSCALE_IPV4:$SSH_PORT"; do
+        if ! grep -qix "$expect" <<< "$eff"; then
+            log ERROR "Configuração efetiva não contém: '$expect'"
+            rollback_ssh
+            exit 1
+        fi
+    done
+    if grep -qiE "^listenaddress (0\.0\.0\.0|\[::\]):" <<< "$eff"; then
+        log ERROR "SSH ainda escutaria em todos os IPs"
+        rollback_ssh
+        exit 1
+    fi
+
+    restart_ssh
+    local listening
+    listening=$(ss -tlnH | awk '{print $4}')
+    if ! grep -qx "$TAILSCALE_IPV4:$SSH_PORT" <<< "$listening"; then
+        log ERROR "SSH não está escutando em $TAILSCALE_IPV4:$SSH_PORT"
+        rollback_ssh
+        exit 1
+    fi
+
+    # Teste real antes de seguir: se não funcionar, desfaz e você continua com o acesso atual
+    echo ""
+    echo -e "${COLOR_BOLD}${COLOR_YELLOW}════════════════════════════════════════════════════════${COLOR_RESET}"
+    echo -e "${COLOR_BOLD}${COLOR_YELLOW}  🔐 TESTE O NOVO ACESSO (não feche esta sessão!)${COLOR_RESET}"
+    echo -e "${COLOR_BOLD}${COLOR_YELLOW}════════════════════════════════════════════════════════${COLOR_RESET}"
+    echo "  Em OUTRO terminal, com o Tailscale ligado no seu computador:"
+    echo ""
+    echo "    ssh -i <sua-chave-privada> $SSH_USER@$TAILSCALE_IPV4"
+    echo "    sudo -v        # confirme que a senha do sudo funciona"
+    echo ""
+    local ok
+    read -r -p "  O login e o sudo funcionaram? [s/N]: " ok
+    if [[ ! "$ok" =~ ^[Ss]$ ]]; then
+        rollback_ssh
+        log ERROR "Configuração SSH desfeita. Verifique Tailscale/chave e rode o script de novo."
+        exit 1
+    fi
+
+    log SUCCESS "SSH: só chave, só Tailscale ($TAILSCALE_IPV4:$SSH_PORT), root bloqueado"
+    log SUCCESS "Kex: $kex"
 }
 
-phase_fail2ban() {
-    local PHASE="fail2ban"
-    if is_phase_completed "$PHASE"; then
-        log INFO "Fase '$PHASE' já concluída. Pulando..."
-        return 0
-    fi
-    
-    log PHASE "Fase 11/14: Instalar Fail2Ban"
-    local phase_start=$(date +%s)
-    
-    apt install -y -qq fail2ban >> "$LOG_FILE" 2>&1
-    
-    tee /etc/fail2ban/jail.local > /dev/null << FAIL2BAN_CONF
-[DEFAULT]
-bantime = -1
-findtime = 600
-maxretry = 3
-destemail = root@localhost
-sendername = Fail2Ban-$(hostname)
-action = %(action_)s
+phase_firewall() {
+    sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
 
-[sshd]
-enabled = true
-port = $SSH_PORT
-filter = sshd
-logpath = /var/log/auth.log
-maxretry = 3
-bantime = -1
-
-[sshd-ddos]
-enabled = true
-port = $SSH_PORT
-filter = sshd-ddos
-logpath = /var/log/auth.log
-maxretry = 5
-bantime = 3600
-FAIL2BAN_CONF
-    
-    systemctl enable fail2ban 2>&1 | tee -a "$LOG_FILE"
-    systemctl restart fail2ban 2>&1 | tee -a "$LOG_FILE"
-    
-    log SUCCESS "Fail2Ban configurado (porta $SSH_PORT protegida)"
-    log INFO "  • Escopo: SSH brute force via Tailscale (auth.log)"
-    
-    local phase_end=$(date +%s)
-    local phase_duration=$((phase_end - phase_start))
-    log SUCCESS "Fase concluída em $(format_time $phase_duration) | Tempo total: $(get_elapsed_time)"
-    
-    mark_phase_completed "$PHASE"
-    show_progress
-}
-
-phase_firewall_ufw() {
-    local PHASE="firewall_ufw"
-    if is_phase_completed "$PHASE"; then
-        log INFO "Fase '$PHASE' já concluída. Pulando..."
-        return 0
-    fi
-    
-    log PHASE "Fase 12/14: Configurar Firewall UFW (acesso público apenas HTTP/HTTPS)"
-    local phase_start=$(date +%s)
-    
-    # Instalar UFW se não estiver instalado
-    if ! command -v ufw &> /dev/null; then
-        log INFO "Instalando UFW..."
-        apt install -y -qq ufw >> "$LOG_FILE" 2>&1
-    fi
-    
-    # Garantir que UFW suporte IPv6
-    log INFO "Garantindo suporte a IPv6 no UFW..."
-    if [ -f /etc/default/ufw ]; then
-        sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
-        log SUCCESS "✅ IPv6 habilitado no UFW"
-    fi
-
-    # Resetar regras (limpar configurações anteriores)
-    log INFO "Resetando configurações do UFW..."
     ufw --force reset >> "$LOG_FILE" 2>&1
-    
-    # Configurar políticas padrão
-    log INFO "Configurando políticas padrão..."
     ufw default deny incoming >> "$LOG_FILE" 2>&1
     ufw default allow outgoing >> "$LOG_FILE" 2>&1
-    
-    # Permitir HTTP e HTTPS publicamente (portas 80 e 443)
-    log INFO "Liberando portas HTTP/HTTPS (acesso público)..."
-    ufw allow 80/tcp comment 'HTTP - public' >> "$LOG_FILE" 2>&1
-    ufw allow 443/tcp comment 'HTTPS - public' >> "$LOG_FILE" 2>&1
-    log SUCCESS "✅ Portas 80 (HTTP) e 443 (HTTPS) liberadas"
-    log INFO    "  • Para restringir aos IPs da Cloudflare, execute: bash cloudflare-update-ufw.sh"
-    
-    # Permitir TUDO via Tailscale (VPN privada)
-    log INFO "Liberando interface Tailscale (acesso total via VPN)..."
-    ufw allow in on tailscale0 comment 'Tailscale VPN - full access' >> "$LOG_FILE" 2>&1
-    log SUCCESS "✅ Interface Tailscale liberada - SSH e outras portas acessíveis APENAS via VPN"
-    
-    # Mostrar configuração antes de habilitar
-    echo ""
-    echo -e "${COLOR_BOLD}${COLOR_YELLOW}════════════════════════════════════════════════════════${COLOR_RESET}"
-    echo -e "${COLOR_BOLD}${COLOR_YELLOW}  ⚠️  ATENÇÃO: UFW será habilitado!${COLOR_RESET}"
-    echo -e "${COLOR_BOLD}${COLOR_YELLOW}════════════════════════════════════════════════════════${COLOR_RESET}"
-    echo ""
-    echo "Regras configuradas:"
-    echo "  ✅ HTTP: 80/tcp (PÚBLICO)"
-    echo "  ✅ HTTPS: 443/tcp (PÚBLICO)"
-    echo "  ✅ SSH: porta $SSH_PORT (APENAS via Tailscale)"
-    echo "  ✅ Todas outras portas: (APENAS via Tailscale)"
-    echo "  ❌ Política padrão: DENY (bloqueia acesso público)"
-    echo ""
-    echo -e "${COLOR_RED}${COLOR_BOLD}IMPORTANTE:${COLOR_RESET}"
-    echo "  • Acesso público: APENAS HTTP (80) e HTTPS (443)"
-    echo "  • Para Cloudflare-Only execute: bash cloudflare-update-ufw.sh"
-    echo "  • SSH, painéis, DBs, etc: APENAS via Tailscale VPN"
-    echo "  • Conecte via: ssh $SSH_USER@$TAILSCALE_IPV4 -p $SSH_PORT"
-    echo "  • Para acessar outras portas, conecte primeiro ao Tailscale"
-    echo ""
-    
-    # Habilitar UFW e configurar logging
-    log WARNING "Habilitando UFW..."
-    ufw --force enable >> "$LOG_FILE" 2>&1
-    ufw logging medium >> "$LOG_FILE" 2>&1
-    log SUCCESS "✅ UFW logging configurado em modo medium (loga pacotes bloqueados por regra + política)"
-    
-    # Verificar status
-    if ufw status | grep -q "Status: active"; then
-        log SUCCESS "✅ UFW habilitado e ativo"
-        echo ""
-        log INFO "Status do UFW:"
-        ufw status numbered 2>&1 | tee -a "$LOG_FILE"
+    ufw allow in on tailscale0 comment 'Tailscale - acesso total' >> "$LOG_FILE" 2>&1
+
+    # Script de atualização dos IPs da Cloudflare (UFW + DOCKER-USER)
+    cat > "$CF_SCRIPT" << 'EOF'
+#!/bin/bash
+# Gerado por 01-startup.sh — sincroniza as faixas de IP da Cloudflare com o firewall.
+# Libera 80/443 apenas para a Cloudflare no UFW e reaplica o DOCKER-USER.
+# Uso: cloudflare-update-firewall.sh [--force]
+set -euo pipefail
+export LC_ALL=C
+LIST=/etc/cloudflare-ips.txt
+TMP=$(mktemp); trap 'rm -f "$TMP"' EXIT
+log() { echo "[cloudflare-update-firewall] $*"; }
+
+if ! { curl -fsS --max-time 30 --retry 3 https://www.cloudflare.com/ips-v4 && echo &&
+        curl -fsS --max-time 30 --retry 3 https://www.cloudflare.com/ips-v6 && echo
+      } > "$TMP.raw"; then
+    log "ERRO: não foi possível baixar a lista da Cloudflare. Nada foi alterado."
+    rm -f "$TMP.raw"
+    exit 1
+fi
+tr -d '\r' < "$TMP.raw" \
+  | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$|^[0-9a-fA-F:]+/[0-9]{1,3}$' \
+  | sort -u > "$TMP" || true
+rm -f "$TMP.raw"
+
+v4=$(grep -c '\.' "$TMP" || true)
+v6=$(grep -c ':' "$TMP" || true)
+if [ "$v4" -lt 5 ] || [ "$v6" -lt 3 ]; then
+    log "ERRO: lista suspeita (IPv4=$v4, IPv6=$v6). Nada foi alterado."
+    exit 1
+fi
+
+touch "$LIST"
+if cmp -s "$TMP" "$LIST" && [ "${1:-}" != "--force" ]; then
+    log "Sem mudanças ($v4 IPv4 + $v6 IPv6)."
+    exit 0
+fi
+
+# Remove regras públicas de 80/443 (modo aberto), se existirem
+for p in 80 443; do ufw delete allow "$p/tcp" >/dev/null 2>&1 || true; done
+
+# Remove faixas que saíram da lista da Cloudflare
+comm -23 "$LIST" "$TMP" | while read -r ip; do
+    [ -n "$ip" ] || continue
+    for p in 80 443; do ufw delete allow proto tcp from "$ip" to any port "$p" >/dev/null 2>&1 || true; done
+    log "Removido: $ip"
+done
+
+# Adiciona as faixas atuais (o UFW ignora regras já existentes)
+while read -r ip; do
+    for p in 80 443; do ufw allow proto tcp from "$ip" to any port "$p" comment 'Cloudflare' >/dev/null; done
+done < "$TMP"
+
+install -m 644 "$TMP" "$LIST"
+if systemctl is-enabled --quiet docker-user-firewall.service 2>/dev/null; then
+    systemctl restart docker-user-firewall.service
+fi
+log "Atualizado: $v4 faixas IPv4 + $v6 faixas IPv6."
+EOF
+    chmod 755 "$CF_SCRIPT"
+
+    cat > /etc/systemd/system/cloudflare-update-firewall.service << EOF
+[Unit]
+Description=Atualiza IPs da Cloudflare no UFW e DOCKER-USER
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$CF_SCRIPT
+EOF
+    cat > /etc/systemd/system/cloudflare-update-firewall.timer << 'EOF'
+[Unit]
+Description=Atualiza IPs da Cloudflare semanalmente
+
+[Timer]
+OnCalendar=weekly
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+
+    if [ "$CF_ONLY" = "S" ]; then
+        if "$CF_SCRIPT" --force 2>&1 | tee -a "$LOG_FILE"; then
+            systemctl enable --now cloudflare-update-firewall.timer >> "$LOG_FILE" 2>&1
+            log SUCCESS "80/443 liberados SÓ para a Cloudflare (atualização semanal automática)"
+        else
+            log WARNING "Não foi possível baixar os IPs da Cloudflare — abrindo 80/443 para todos"
+            log WARNING "Depois rode: sudo $CF_SCRIPT --force && sudo systemctl enable --now cloudflare-update-firewall.timer"
+            ufw allow 80/tcp comment 'HTTP - publico' >> "$LOG_FILE" 2>&1
+            ufw allow 443/tcp comment 'HTTPS - publico' >> "$LOG_FILE" 2>&1
+        fi
     else
-        log ERROR "❌ Falha ao habilitar UFW"
+        ufw allow 80/tcp comment 'HTTP - publico' >> "$LOG_FILE" 2>&1
+        ufw allow 443/tcp comment 'HTTPS - publico' >> "$LOG_FILE" 2>&1
+        log SUCCESS "80/443 públicos (para Cloudflare-only depois: sudo $CF_SCRIPT --force)"
+    fi
+
+    ufw logging low >> "$LOG_FILE" 2>&1
+    ufw --force enable >> "$LOG_FILE" 2>&1
+    local ufw_status
+    ufw_status=$(ufw status verbose)
+    echo "$ufw_status" | tee -a "$LOG_FILE"
+    if ! grep -q "Status: active" <<< "$ufw_status"; then
+        log ERROR "UFW não ativou"
         exit 1
     fi
-    
-    local phase_end=$(date +%s)
-    local phase_duration=$((phase_end - phase_start))
-    log SUCCESS "Fase concluída em $(format_time $phase_duration) | Tempo total: $(get_elapsed_time)"
-    
-    mark_phase_completed "$PHASE"
-    show_progress
+    log SUCCESS "UFW ativo: tudo bloqueado exceto 80/443 e Tailscale"
 }
 
-phase_auditd() {
-    local PHASE="auditd"
-    if is_phase_completed "$PHASE"; then
-        log INFO "Fase '$PHASE' já concluída. Pulando..."
+phase_docker() {
+    if [ "$INSTALL_DOCKER" != "S" ]; then
+        log INFO "Docker não selecionado — pulando"
+        log INFO "  • Para instalar depois, rode o script de novo em uma VPS nova ou instale manualmente"
         return 0
     fi
-    
-    log PHASE "Fase 13/14: Instalar Auditd (otimizado para performance)"
-    local phase_start=$(date +%s)
-    
-    apt install -y -qq auditd audispd-plugins >> "$LOG_FILE" 2>&1
-    
-    # Configurar regras OTIMIZADAS (apenas críticas, sem overhead)
-    tee /etc/audit/rules.d/hardening.rules > /dev/null << 'AUDIT_RULES'
--D
 
-# Buffer reduzido para melhor performance
--b 2048
+    if ! command -v docker &>/dev/null; then
+        log INFO "Adicionando repositório oficial do Docker..."
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+        chmod a+r /etc/apt/keyrings/docker.asc
+        # shellcheck disable=SC1091
+        cat > /etc/apt/sources.list.d/docker.sources << EOF
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+        "${APT_GET[@]}" update >> "$LOG_FILE" 2>&1
+        log INFO "Instalando Docker Engine..."
+        "${APT_GET[@]}" install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >> "$LOG_FILE" 2>&1
+    fi
 
-# Failure mode (1 = continua funcionando mesmo com erro)
--f 1
+    # Padrões seguros:
+    #  ip=127.0.0.1         → porta publicada sem IP explícito escuta só no localhost
+    #  no-new-privileges    → processo no container não ganha privilégio via setuid
+    #  live-restore         → containers continuam rodando quando o Docker atualiza
+    #  log rotation         → 3 × 10 MB por container
+    mkdir -p /etc/docker
+    cat > /etc/docker/daemon.json << 'EOF'
+{
+  "ip": "127.0.0.1",
+  "no-new-privileges": true,
+  "live-restore": true,
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
+}
+EOF
+    systemctl enable docker >> "$LOG_FILE" 2>&1
+    systemctl restart docker
+    docker info &>/dev/null
+    log SUCCESS "Docker $(docker version --format '{{.Server.Version}}') rodando"
 
-# ===== Arquivos críticos do sistema (baixo overhead) =====
--w /etc/passwd -p wa -k passwd_changes
--w /etc/shadow -p wa -k shadow_changes
--w /etc/ssh/sshd_config -p wa -k sshd_changes
+    # Por que DOCKER-USER: portas publicadas pelo Docker passam pela chain FORWARD,
+    # que o UFW não filtra. Sem isso, "-p 9443:9443" ficaria aberto para a internet.
+    cat > "$DU_SCRIPT" << 'EOF'
+#!/bin/bash
+# Gerado por 01-startup.sh — firewall dos containers (chain DOCKER-USER).
+# Internet → containers: só 80/443 (e só da Cloudflare, se /etc/cloudflare-ips.txt existir).
+# Tailscale → containers: tudo. Tráfego entre containers: inalterado.
+set -uo pipefail
+LIST=/etc/cloudflare-ips.txt
 
-# ===== Comandos de privilégio (essencial para segurança) =====
--w /usr/bin/sudo -p x -k sudo_execution
--w /bin/su -p x -k su_execution
+iface() { ip "$1" route show default 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}'; }
+IF4=$(iface -4); IF4=${IF4:-eth0}
+IF6=$(iface -6); IF6=${IF6:-$IF4}
 
-# Nota: Regras pesadas removidas para melhor performance:
-# - Monitoramento de /home e /var/www (muito I/O)
-# - Syscalls execve (loga todas execuções)
-# - Mudanças de permissão (overhead em deployments)
-# - wget/curl (comum em APIs)
-AUDIT_RULES
-    
-    sed -i 's/^max_log_file = .*/max_log_file = 50/' /etc/audit/auditd.conf
-    sed -i 's/^num_logs = .*/num_logs = 10/' /etc/audit/auditd.conf
-    sed -i 's/^max_log_file_action = .*/max_log_file_action = rotate/' /etc/audit/auditd.conf
-    
-    systemctl enable auditd 2>&1 | tee -a "$LOG_FILE"
-    systemctl restart auditd 2>&1 | tee -a "$LOG_FILE"
-    augenrules --load 2>&1 | tee -a "$LOG_FILE"
-    
-    log SUCCESS "Auditd configurado (logs em /var/log/audit/)"
-    
-    local phase_end=$(date +%s)
-    local phase_duration=$((phase_end - phase_start))
-    log SUCCESS "Fase concluída em $(format_time $phase_duration) | Tempo total: $(get_elapsed_time)"
-    
-    mark_phase_completed "$PHASE"
-    show_progress
+apply() {
+    local ipt=$1 ifc=$2 family=$3 src p
+    if ! $ipt -n -L DOCKER-USER >/dev/null 2>&1; then
+        echo "DOCKER-USER não existe em $ipt (Docker parado ou sem IPv6) — pulando"
+        return 0
+    fi
+    $ipt -F DOCKER-USER
+    $ipt -A DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    $ipt -A DOCKER-USER -i tailscale0 -j ACCEPT
+    # --ctorigdstport = porta PUBLICADA no host (antes do DNAT), não a porta interna do container
+    if [ -s "$LIST" ]; then
+        while read -r src; do
+            for p in 80 443; do
+                $ipt -A DOCKER-USER -i "$ifc" -s "$src" -p tcp -m conntrack --ctorigdstport "$p" --ctdir ORIGINAL -j ACCEPT
+            done
+        done < <(grep -E "$family" "$LIST")
+    else
+        for p in 80 443; do
+            $ipt -A DOCKER-USER -i "$ifc" -p tcp -m conntrack --ctorigdstport "$p" --ctdir ORIGINAL -j ACCEPT
+        done
+    fi
+    $ipt -A DOCKER-USER -i "$ifc" -j DROP
+    $ipt -A DOCKER-USER -j RETURN
+    echo "$ipt: DOCKER-USER aplicado em $ifc"
 }
 
-# ════════════════════════════════════════════════════════
-# FASE: DOCKER
-# ════════════════════════════════════════════════════════
+apply iptables  "$IF4" '\.'
+apply ip6tables "$IF6" ':'
+EOF
+    chmod 755 "$DU_SCRIPT"
+
+    cat > /etc/systemd/system/docker-user-firewall.service << EOF
+[Unit]
+Description=Firewall dos containers (chain DOCKER-USER)
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=$DU_SCRIPT
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target docker.service
+EOF
+    systemctl daemon-reload
+    systemctl enable docker-user-firewall.service >> "$LOG_FILE" 2>&1
+    systemctl restart docker-user-firewall.service
+    local du_rules
+    du_rules=$(iptables -S DOCKER-USER)
+    echo "$du_rules" >> "$LOG_FILE"
+    if ! grep -q -- "-j DROP" <<< "$du_rules"; then
+        log ERROR "Regras DOCKER-USER não foram aplicadas (veja: journalctl -u docker-user-firewall)"
+        exit 1
+    fi
+    log SUCCESS "DOCKER-USER ativo: internet → containers só em 80/443$([ -s "$CF_LIST" ] && echo " (Cloudflare)")"
+    log INFO "  • Admin (Portainer, Grafana...): publique no IP do Tailscale, ex.: \"$TAILSCALE_IPV4:9443:9443\""
+    log INFO "  • Traefik: publique explicitamente \"0.0.0.0:80:80\" e \"0.0.0.0:443:443\""
+    log INFO "  • Docker exige sudo (não adicionamos $SSH_USER ao grupo docker: isso equivale a root)"
+}
 
 phase_logging() {
-    local PHASE="logging"
-    if is_phase_completed "$PHASE"; then
-        log INFO "Fase '$PHASE' já concluída. Pulando..."
-        return 0
-    fi
-    
-    log PHASE "Fase 15/14: Configurar logging do sistema"
-    local phase_start=$(date +%s)
-    
-    tee /etc/logrotate.d/sudo > /dev/null << 'EOF_LOGROTATE'
-/var/log/sudo.log {
-    weekly
-    rotate 4
-    compress
-    missingok
-    notifempty
-}
-EOF_LOGROTATE
-    
-    systemctl enable rsyslog 2>&1 | tee -a "$LOG_FILE"
-    systemctl start rsyslog 2>&1 | tee -a "$LOG_FILE"
-    
-    sed -i 's/^#*Storage=.*/Storage=persistent/' /etc/systemd/journald.conf
-    sed -i 's/^#*SystemMaxUse=.*/SystemMaxUse=500M/' /etc/systemd/journald.conf
-    systemctl restart systemd-journald 2>&1 | tee -a "$LOG_FILE"
-    
-    log SUCCESS "Logging configurado"
-    
-    local phase_end=$(date +%s)
-    local phase_duration=$((phase_end - phase_start))
-    log SUCCESS "Fase concluída em $(format_time $phase_duration) | Tempo total: $(get_elapsed_time)"
-    
-    mark_phase_completed "$PHASE"
-    show_progress
+    mkdir -p /etc/systemd/journald.conf.d
+    cat > /etc/systemd/journald.conf.d/90-hardening.conf << 'EOF'
+# Gerado por 01-startup.sh — logs persistentes com limite de disco
+[Journal]
+Storage=persistent
+SystemMaxUse=500M
+MaxRetentionSec=3month
+EOF
+    systemctl restart systemd-journald
+    log SUCCESS "Journald persistente (máx. 500 MB / 3 meses). Logs do Docker: 3 × 10 MB por container"
 }
 
-# ════════════════════════════════════════════════════════
-# FASE: BLOQUEIO DE MÓDULOS DE KERNEL
-# ════════════════════════════════════════════════════════
-
-phase_kernel_modules() {
-    local PHASE="kernel_modules"
-    if is_phase_completed "$PHASE"; then
-        log INFO "Fase '$PHASE' já concluída. Pulando..."
-        return 0
-    fi
-
-    log PHASE "Bloqueando módulos de kernel desnecessários (CIS Benchmark)"
-    local phase_start=$(date +%s)
-
-    cat > /etc/modprobe.d/blacklist-hardening.conf << 'MOD_CONF'
-# ════════════════════════════════════════════════════════
-# Módulos de kernel bloqueados — reduz superfície de ataque
-# Gerado pelo script de hardening
-# ════════════════════════════════════════════════════════
-
-# Protocolos de rede não utilizados em servidores
-install dccp /bin/true
-install sctp /bin/true
-install rds /bin/true
-install tipc /bin/true
-
-# Filesystems raramente usados em ambientes de servidor
-install cramfs /bin/true
-install freevxfs /bin/true
-install jffs2 /bin/true
-install hfs /bin/true
-install hfsplus /bin/true
-install udf /bin/true
-MOD_CONF
-
-    # Recarregar initramfs para garantir aplicação no próximo boot
-    if command -v update-initramfs &> /dev/null; then
-        update-initramfs -u >> "$LOG_FILE" 2>&1 || true
-    fi
-
-    log SUCCESS "Módulos de kernel bloqueados:"
-    log SUCCESS "  • Protocolos de rede: dccp, sctp, rds, tipc"
-    log SUCCESS "  • Filesystems desnecessários: cramfs, freevxfs, jffs2, hfs, hfsplus, udf"
-    log WARNING "  ⚠️  Efeito total após reboot (será feito automaticamente ao final)"
-
-    local phase_end=$(date +%s)
-    local phase_duration=$((phase_end - phase_start))
-    log SUCCESS "Fase concluída em $(format_time $phase_duration) | Tempo total: $(get_elapsed_time)"
-
-    mark_phase_completed "$PHASE"
-    show_progress
-}
-
-# ════════════════════════════════════════════════════════
 # ════════════════════════════════════════════════════════
 # RESUMO FINAL
 # ════════════════════════════════════════════════════════
 
 show_summary() {
-    echo ""
-    echo -e "${COLOR_BOLD}════════════════════════════════════════════════════════${COLOR_RESET}"
-    echo -e "${COLOR_BOLD}${COLOR_GREEN}  ✅ CONFIGURAÇÃO CONCLUÍDA COM SUCESSO!${COLOR_RESET}"
-    echo -e "${COLOR_BOLD}════════════════════════════════════════════════════════${COLOR_RESET}"
-    echo ""
-    echo "📊 Resumo das configurações aplicadas:"
-    echo ""
-    echo "  🕒 Sistema:"
-    echo "    • Timezone: America/Sao_Paulo"
-    echo "    • SWAP: ${SWAP_SIZE}GB"
-    [[ "$INSTALL_UPGRADES" =~ ^[Ss]$ ]] && echo "    • Atualizações de segurança: AUTOMÁTICAS"
-    echo ""
-    echo "  🛡️  Segurança do Kernel:"
-    echo "    • ASLR habilitado"
-    echo "    • ptrace restrito"
-    echo "    • Core dumps desabilitados"
-    echo ""
-    echo "  🌐 Hardening de Rede:"
-    echo "    • IP forwarding desabilitado"
-    echo "    • ICMP/TCP redirects bloqueados (IPv4 + IPv6)"
-    echo "    • Reverse path filter ativado (anti-spoofing)"
-    echo "    • SYN cookies + tcp_rfc1337 + synack_retries=2"
-    echo "    • Conntrack: 1M conexões, timeouts reduzidos"
-    echo "    • BBR congestion control ativo"
-    echo "    • File descriptors: 1M"
-    echo ""
-    echo "  🔐 SSH:"
-    echo "    • Porta: $SSH_PORT"
-    echo "    • Usuário: $SSH_USER (chave privada apenas)"
-    echo "    • Acesso APENAS via Tailscale: $TAILSCALE_IPV4"
-    if [ "$SSH_USER" = "root" ]; then
-        echo "    • Root login: CHAVE SSH APENAS"
-    else
-        echo "    • Root login: BLOQUEADO"
-    fi
-    echo ""
-    echo "  🔒 Tailscale VPN:"
-    echo "    • IPv4: $TAILSCALE_IPV4"
-    [ -n "$TAILSCALE_IPV6" ] && echo "    • IPv6: $TAILSCALE_IPV6"
-    echo "    • Status: Conectado"
-    echo ""
-    echo "  🛡️  Firewall UFW:"
-    echo "    • HTTP (80): PÚBLICO"
-    echo "    • HTTPS (443): PÚBLICO"
-    echo "    • Cloudflare-Only: execute bash cloudflare-update-ufw.sh"
-    echo "    • SSH ($SSH_PORT): APENAS VIA TAILSCALE"
-    echo "    • Outras portas: APENAS VIA TAILSCALE"
-    echo "    • IPv6: HABILITADO"
-    echo ""
-    echo "  🔍 Sistemas de Detecção:"
-    [[ "$INSTALL_AUDITD" =~ ^[Ss]$ ]] && echo "    • Auditd: ATIVO (otimizado)"
-    echo "    • Fail2Ban: ATIVO (escopo: SSH)"
-    [[ "$INSTALL_MOD_BLOCK" =~ ^[Ss]$ ]] && echo "    • Módulos kernel bloqueados: dccp, sctp, rds, tipc"
-    echo ""
-    echo "   Logs: /var/log/"
-    echo ""
-    echo -e "${COLOR_BOLD}════════════════════════════════════════════════════════${COLOR_RESET}"
-    echo -e "${COLOR_BOLD}  ⚠️  IMPORTANTE: Anote estas informações!${COLOR_RESET}"
-    echo -e "${COLOR_BOLD}════════════════════════════════════════════════════════${COLOR_RESET}"
-    echo "  🔐 Acesso SSH (APENAS via Tailscale):"
-    echo "    ssh $SSH_USER@$TAILSCALE_IPV4 -p $SSH_PORT"
-    echo ""
-    echo "  🌐 Acesso Web:"
-    echo "    • HTTP: http://SEU_IP_PUBLICO"
-    echo "    • HTTPS: https://SEU_IP_PUBLICO"
-    echo "    • Para Cloudflare-Only: bash cloudflare-update-ufw.sh"
-    echo ""
-    echo "  📝 Logs deste script:"
-    echo "    • Log completo: $LOG_FILE"
-    echo "    • Log de erros: $ERROR_LOG"
-    echo ""
-    
-    # Salvar informações importantes em arquivo
-    cat > /root/server-info.txt << EOF_INFO
+    local total=$(( $(date +%s) - START_TIME ))
+    local summary
+    summary=$(cat << EOF
 ════════════════════════════════════════════════════════
-INFORMAÇÕES DO SERVIDOR - $(date)
+  SERVIDOR CONFIGURADO — $(date '+%Y-%m-%d %H:%M')
 ════════════════════════════════════════════════════════
 
-SSH (APENAS via Tailscale):
-  Comando: ssh $SSH_USER@$TAILSCALE_IPV4 -p $SSH_PORT
-  Usuário: $SSH_USER
-  Porta: $SSH_PORT
-  Autenticação: Chave privada apenas
+ACESSO SSH (somente via Tailscale, somente chave)
+  ssh $SSH_USER@$TAILSCALE_IPV4
+  Root: bloqueado | Senha do $SSH_USER: só para sudo e console web
 
-Tailscale VPN:
+TAILSCALE
   IPv4: $TAILSCALE_IPV4
-  IPv6: $TAILSCALE_IPV6
-  Interface: tailscale0
+  IPv6: ${TAILSCALE_IPV6:-—}
+  Lembre: expiração da chave desativada no painel
 
-Firewall UFW:
-  • HTTP/HTTPS (80/443): PÚBLICO
-  • Outras portas: APENAS via Tailscale
-  • Cloudflare-Only: execute bash cloudflare-update-ufw.sh para restringir
+FIREWALL
+  UFW: tudo bloqueado, exceto Tailscale e 80/443
+  80/443: $([ "$CF_ONLY" = "S" ] && echo "somente IPs da Cloudflare (atualização semanal)" || echo "público")
+  Containers: $([ "$INSTALL_DOCKER" = "S" ] && echo "DOCKER-USER (internet só alcança 80/443)" || echo "Docker não instalado")
 
-Sistema:
-  • Timezone: America/Sao_Paulo
-  • SWAP: ${SWAP_SIZE}GB
-  • Atualizações automáticas: $([ "$INSTALL_UPGRADES" = "S" ] && echo "SIM" || echo "NÃO")
+SISTEMA
+  Ubuntu: $(. /etc/os-release && echo "$PRETTY_NAME")
+  SWAP: ${SWAP_SIZE} GB (swappiness 10)
+  Atualizações de segurança: automáticas, SEM reboot automático
+  Docker: $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "não instalado")
 
-Segurança:
-  • Fail2Ban: Ativo
-  • Auditd: $([ "$INSTALL_AUDITD" = "S" ] && echo "Ativo" || echo "Desativado")
+ARQUIVOS
+  SSH:       $SSHD_DROPIN
+  Sysctl:    $SYSCTL_FILE
+  Firewall:  $CF_SCRIPT
+             $DU_SCRIPT
+  Log:       $LOG_FILE
 
-Logs do script:
-  • $LOG_FILE
-  • $ERROR_LOG
-
+Validar: sudo bash $SCRIPT_DIR/_audit.sh
+Tempo total: $(format_time $total)
 ════════════════════════════════════════════════════════
-EOF_INFO
-    
-    log SUCCESS "Informações salvas em: /root/server-info.txt"
-    echo -e "${COLOR_BOLD}════════════════════════════════════════════════════════${COLOR_RESET}"
+EOF
+)
+    echo ""
+    echo "$summary"
+    echo "$summary" > /root/server-info.txt
+    chmod 600 /root/server-info.txt
+    log SUCCESS "Resumo salvo em /root/server-info.txt"
 }
 
 # ════════════════════════════════════════════════════════
@@ -1587,135 +1154,49 @@ EOF_INFO
 # ════════════════════════════════════════════════════════
 
 main() {
-    # Verificações iniciais
     check_root
     check_ubuntu
-    
-    log INFO "════════════════════════════════════════════════════════"
-    log INFO "  Script de Hardening de Servidor Ubuntu - Default VPS"
-    log INFO "  Acesso seguro via Tailscale (exceto HTTP/HTTPS)"
-    log INFO "  Log: $LOG_FILE"
-    log INFO "════════════════════════════════════════════════════════"
-    
-    # Verificar se há checkpoint
+
+    if [ -z "$(public_iface)" ]; then
+        log ERROR "Não foi possível detectar a interface de rede pública (rota default)"
+        exit 1
+    fi
+
+    log INFO "Log desta execução: $LOG_FILE"
+
     if [ -f "$CHECKPOINT_FILE" ]; then
-        local completed=$(get_completed_phases)
-        log WARNING "Checkpoint encontrado! $completed de $TOTAL_PHASES fases concluídas."
-        echo ""
-        echo "Opções:"
+        log WARNING "Execução anterior encontrada: $(get_completed_phases) de $TOTAL_PHASES fases concluídas."
         echo "  1) Continuar de onde parou"
-        echo "  2) Recomeçar do zero (apaga checkpoint)"
+        echo "  2) Recomeçar do zero"
         echo "  3) Sair"
-        read -p "Escolha [1-3]: " choice
-        
+        local choice
+        read -r -p "Escolha [1-3]: " choice
         case $choice in
-            1)
-                log INFO "Continuando instalação..."
-                load_config
-                ;;
-            2)
-                log WARNING "Resetando checkpoint..."
-                reset_checkpoint
-                rm -f "${SCRIPT_DIR}/.startup-config"
-                interactive_config
-                ;;
-            3)
-                log INFO "Saindo..."
-                exit 0
-                ;;
-            *)
-                log ERROR "Opção inválida"
-                exit 1
-                ;;
+            1) load_config ;;
+            2) rm -f "$CHECKPOINT_FILE" "$CONFIG_FILE"; interactive_config ;;
+            *) exit 0 ;;
         esac
     else
-        # Primeira execução
         interactive_config
     fi
-    
-    echo ""
-    log INFO "Iniciando configuração do sistema..."
-    show_progress
-    echo ""
-    
-    # Executar todas as fases
-    phase_ubuntu_password
-    phase_timezone
-    phase_system_update
-    
-    # Fases opcionais
-    if [[ "$INSTALL_UPGRADES" =~ ^[Ss]$ ]]; then
-        phase_unattended_upgrades
-    else
-        log INFO "⏭️  Pulando Unattended Upgrades (opcional)"
-        # Marcar como concluída para não quebrar a contagem de progresso
-        mark_phase_completed "unattended_upgrades"
-    fi
-    
-    phase_kernel_security
-    phase_network_hardening
-    phase_swap
-    phase_ssh_key
-    phase_tailscale  # Fase 9: Instalar Tailscale
-    phase_ssh_config # Fase 10: Configurar SSH para escutar apenas no Tailscale
-    phase_fail2ban
-    phase_firewall_ufw # Fase 12: UFW - 80/443 (Cloudflare-only ou público) + resto via Tailscale
 
-    if [[ "$INSTALL_MOD_BLOCK" =~ ^[Ss]$ ]]; then
-        phase_kernel_modules
-    else
-        log INFO "⏭️  Pulando bloqueio de módulos de kernel (opcional)"
-        mark_phase_completed "kernel_modules"
-    fi
-
-    if [[ "$INSTALL_AUDITD" =~ ^[Ss]$ ]]; then
-        phase_auditd
-    else
-        log INFO "⏭️  Pulando Auditd (opcional)"
-        mark_phase_completed "auditd"
-    fi
-
-    if [[ "$INSTALL_LOGGING" =~ ^[Ss]$ ]]; then
-        phase_logging
-    else
-        log INFO "⏭️  Pulando Logging Avançado (opcional)"
-        mark_phase_completed "logging"
-    fi
-
-    # Progress bar final
     echo ""
     show_progress
-    echo ""
-    
-    # Calcular tempo total
-    local end_time=$(date +%s)
-    local total_duration=$((end_time - START_TIME))
-    
-    # Mostrar tempo total
-    echo ""
-    echo -e "${COLOR_BOLD}${COLOR_GREEN}════════════════════════════════════════════════════════${COLOR_RESET}"
-    echo -e "${COLOR_BOLD}${COLOR_GREEN}  ⏱️  TEMPO TOTAL DE EXECUÇÃO: $(format_time $total_duration)${COLOR_RESET}"
-    echo -e "${COLOR_BOLD}${COLOR_GREEN}════════════════════════════════════════════════════════${COLOR_RESET}"
-    echo ""
-    
-    # Mostrar resumo
+    run_all_phases
     show_summary
-    
-    # Limpar checkpoint e config
-    rm -f "$CHECKPOINT_FILE"
-    rm -f "${SCRIPT_DIR}/.startup-config"
-    
-    log SUCCESS "Script concluído com sucesso!"
-    log INFO "Informações do servidor salvas em: /root/server-info.txt"
+
+    rm -f "$CHECKPOINT_FILE" "$CONFIG_FILE"
+
     echo ""
-    log WARNING "⚠️  Para acessar este servidor:"
-    log WARNING "    1. Conecte ao Tailscale no seu computador"
-    log WARNING "    2. Use: ssh $SSH_USER@$TAILSCALE_IPV4 -p $SSH_PORT"
-    echo ""
-    log INFO "Sistema será reiniciado em 10 segundos..."
-    sleep 10
-    reboot
+    log WARNING "Reinicie para aplicar kernel/módulos. Depois, conecte por: ssh $SSH_USER@$TAILSCALE_IPV4"
+    local rb
+    read -r -p "Reiniciar agora? [S/n]: " rb
+    if [[ "${rb:-S}" =~ ^[Ss]$ ]]; then
+        log INFO "Reiniciando..."
+        systemctl reboot
+    else
+        log INFO "Reinicie quando quiser: sudo reboot"
+    fi
 }
 
-# Executar script
 main "$@"

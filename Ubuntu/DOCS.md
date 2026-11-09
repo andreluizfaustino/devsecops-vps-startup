@@ -1,458 +1,256 @@
-# Documentação Técnica — VPS Hardening Scripts
+# Documentação Técnica — VPS Ubuntu Setup + Hardening
 
-**Autor:** @andreluizfaustino  
+**Autor:** @andreluizfaustino
 **Repositório:** https://github.com/andreluizfaustino/devsecops-vps-startup
-
----
 
 ## Índice
 
-- [Visão Geral da Arquitetura](#visão-geral-da-arquitetura)
-- [01-startup.sh — Hardening do Servidor](#01-startupsh--hardening-do-servidor)
-- [02-docker.sh — Docker + DOCKER-USER Firewall](#02-dockersh--docker--docker-user-firewall)
-- [03-cloudflare-update-ufw.sh — Cloudflare IP Updater](#03-cloudflare-update-ufwsh--cloudflare-ip-updater)
-- [_audit.sh — Auditoria de Saúde](#_auditsh--auditoria-de-saúde)
-- [Serviços systemd](#serviços-systemd)
-- [Arquivos Gerados](#arquivos-gerados)
-- [Fluxo de Execução Recomendado](#fluxo-de-execução-recomendado)
+- [Arquitetura](#arquitetura)
+- [01-startup.sh](#01-startupsh)
+  - [Perguntas iniciais](#perguntas-iniciais)
+  - [As 13 fases](#as-13-fases)
+  - [Checkpoint, erros e logs](#checkpoint-erros-e-logs)
+- [Firewall: UFW, DOCKER-USER e Cloudflare](#firewall-ufw-docker-user-e-cloudflare)
+- [_audit.sh](#_auditsh)
+- [Arquivos e serviços criados](#arquivos-e-serviços-criados)
+- [Decisões de projeto](#decisões-de-projeto)
+- [Recuperação de acesso](#recuperação-de-acesso)
 
 ---
 
-## Visão Geral da Arquitetura
+## Arquitetura
 
 ```
 Internet
-    │
-    ├── Qualquer IP direto
-    │       ├── porta 80/443 → DOCKER-USER: ACCEPT só IPs Cloudflare ✅
-    │       ├── qualquer outra porta → DOCKER-USER: DROP ❌
-    │       └── SSH, painéis, DBs → UFW: DENY ❌
-    │
-    └── Tailscale VPN (100.x.x.x)
-            └── tudo → ACCEPT ✅ (admin e dispositivos autorizados)
+  │
+  ├── 80/443  ──► UFW (INPUT, serviços do host)
+  │              DOCKER-USER (FORWARD, containers)
+  │              aceitam só IPs da Cloudflare (modo Cloudflare-only)
+  │
+  ├── outras portas ──► bloqueadas (UFW e DOCKER-USER)
+  └── SSH ──► não escuta no IP público
 
-Camadas de proteção (de fora para dentro):
-  Cloudflare WAF → UFW (INPUT) → DOCKER-USER (FORWARD) → Fail2Ban → Aplicação
-
-Por que duas camadas de firewall?
-  UFW (INPUT)        → protege o HOST (SSH, serviços nativos)
-  DOCKER-USER (FORWARD) → protege CONTAINERS (Docker bypassa UFW por padrão)
+Tailscale (100.64.0.0/10)
+  └── tudo liberado (SSH, painéis, bancos)
 ```
 
----
+Por que duas camadas de firewall:
 
-## 01-startup.sh — Hardening do Servidor
-
-### Visão Geral
-
-Script principal que aplica **15 fases de hardening** em um servidor Ubuntu recém-criado. Transforma uma VPS padrão em um servidor seguro para produção em ~4 minutos.
-
-```bash
-sudo bash 01-startup.sh
-```
-
-**Requisitos:** Ubuntu 22.04 LTS ou 24.04 LTS, acesso root, conexão com internet.
-
----
-
-### Infraestrutura do Script
-
-#### Sistema de Checkpoint
-Antes de executar qualquer fase, verifica o arquivo `.startup-checkpoint`. Se interrompido, ao executar novamente oferece:
-- **Continuar de onde parou** — refaz apenas as fases pendentes
-- **Recomeçar do zero** — apaga checkpoint e reinicia
-- **Sair**
-
-#### Sistema de Logging
-- `logs/startup-YYYYMMDD_HHMMSS.log` — log completo com timestamps
-- `logs/startup-errors.log` — apenas erros
-
-#### Configuração Salva
-Respostas salvas em `.startup-config` (permissão 600). Recarregadas automaticamente em retomadas.
-
----
-
-### Configuração Interativa
-
-**Informações Obrigatórias:**
-1. **Usuário SSH** — `root`, `ubuntu` ou customizado
-2. **Senha** — solicitada apenas se não for root
-3. **Porta SSH** — aceita 22 ou 1024-65535, padrão: `2222`
-4. **SWAP** — tamanho em GB, mínimo 1GB, padrão: `2`
-5. **Chave pública SSH** — conteúdo do `~/.ssh/id_ed25519.pub`
-
-**Componentes Opcionais:**
-
-| # | Componente | Padrão |
+| Camada | Protege | Por quê |
 |---|---|---|
-| [1] | Unattended Upgrades | S |
-| [2] | Auditd | S |
-| [3] | Logging Avançado | S |
-| [4] | Bloqueio de Módulos de Kernel | S |
+| UFW (chain INPUT) | Serviços do host (SSH, apps fora do Docker) | Firewall padrão do Ubuntu |
+| DOCKER-USER (chain FORWARD) | Containers | Portas publicadas pelo Docker passam pela FORWARD, que o UFW não filtra |
 
 ---
 
-### As 15 Fases
+## 01-startup.sh
 
-#### FASE 1 — Configurar Usuário SSH
-Cria ou usa usuário existente, define senha, adiciona ao grupo sudo.
-
-#### FASE 2 — Timezone
-Define `America/Sao_Paulo`, habilita sincronização NTP.
-
-#### FASE 3 — Atualização do Sistema
-`apt update` + `apt upgrade` + autoremove + autoclean.
-
-#### FASE 4 — Unattended Upgrades *(opcional)*
-Patches de segurança automáticos diários, sem reboot automático.
-
-#### FASE 5 — Segurança do Kernel
-ASLR máximo, ptrace restrito, core dumps desabilitados.
-
-#### FASE 6 — Hardening de Rede + Performance
-| Grupo | Efeito |
-|---|---|
-| Anti-spoofing, anti-redirect, anti-smurf | Impede spoofing e ataques ICMP |
-| SYN cookies + tcp_rfc1337 | Proteção anti-SYN flood |
-| Conntrack 1M conexões | Suporta alta carga sem travar |
-| BBR congestion control | 2-25x mais throughput |
-| TCP tuning (buffers 16MB, somaxconn 4096) | APIs de alto tráfego |
-| File descriptors 1M | Conexões simultâneas |
-
-#### FASE 7 — SWAP
-Cria `/swap/swapfile` com tamanho configurado, persiste no `/etc/fstab`.
-
-#### FASE 8 — Chave SSH
-Instala chave pública em `~/.ssh/authorized_keys` com permissões corretas.
-
-#### FASE 9 — Tailscale VPN ⚠️ *requer ação manual*
-Instala, executa `tailscale up`, pausa para autenticação no navegador, captura IPs.
-
-#### FASE 10 — SSH Hardening *(fase mais crítica)*
-SSH passa a escutar **apenas** nos IPs do Tailscale:
-- Desabilita cloud-init overrides
-- Desabilita autenticação por senha
-- Habilita apenas chave pública
-- Algoritmos modernos: Ed25519, ChaCha20-Poly1305, curve25519
-- Validação com `sshd -t` e rollback automático se falhar
-
-#### FASE 11 — Fail2Ban
-Jails `sshd` (ban permanente após 3 tentativas) e `sshd-ddos` (1h após 5 tentativas). Escopo: `/var/log/auth.log`.
-
-#### FASE 12 — Firewall UFW
-- Política padrão: DENY incoming, ALLOW outgoing
-- Libera 80 e 443 publicamente (substituídos por Cloudflare-Only ao rodar `03`)
-- Libera toda a interface `tailscale0`
-- Logging medium
-
-#### FASE 13 — Bloqueio de Módulos de Kernel *(opcional)*
-Bloqueia: `dccp`, `sctp`, `rds`, `tipc`, `cramfs`, `jffs2`, `hfs`, `hfsplus`, `udf`. Segue CIS Benchmark.
-
-#### FASE 14 — Auditd *(opcional)*
-Monitora: `/etc/passwd`, `/etc/shadow`, `sshd_config`, `sudo`, `su`. Otimizado para ~1% overhead.
-
-#### FASE 15 — Logging Avançado *(opcional)*
-Journald persistente (500MB máx), logrotate para sudo.log, rsyslog ativo.
-
-### Ao Final
-Resumo no terminal, `server-info.txt` em `/root/`, **reboot automático em 10s**.
-
----
-
-## 02-docker.sh — Docker + DOCKER-USER Firewall
-
-### Visão Geral
-
-Instala Docker Engine e configura o firewall `DOCKER-USER` para bloquear acesso direto a containers por IP, permitindo apenas Cloudflare (80/443) e Tailscale. Deve ser executado **após** o `01-startup.sh` e o reboot.
+Roda uma vez, como root, numa VPS recém-criada (Ubuntu 24.04 ou 26.04 LTS).
 
 ```bash
-sudo bash 02-docker.sh
+bash 01-startup.sh
 ```
+
+### Perguntas iniciais
+
+| # | Pergunta | Observações |
+|---|---|---|
+| 1 | Usuário SSH | `ubuntu` (padrão) ou nome customizado. `root` não é aceito. |
+| 2 | Senha do usuário | Mínimo 12 caracteres. Serve para `sudo` e console web — **não** para SSH. Nunca é gravada em disco. |
+| 3 | SWAP | Detecta CPU/RAM/disco e sugere: ≤2 GB RAM → 2× RAM; ≤32 GB → 4 GB; >32 GB → 8 GB. Teto: 10% do disco livre. |
+| 4 | Chave pública SSH | Validada com `ssh-keygen -l`. |
+| 5 | Tailscale / Cloudflare / Docker | Auth key opcional (vazio = login pelo navegador); 80/443 só Cloudflare (padrão S); instalar Docker (padrão S). |
+
+A porta SSH é fixa em 22: o SSH só escuta no Tailscale, então trocar a porta não agrega segurança.
+
+### As 13 fases
+
+| # | Fase | O que faz |
+|---|---|---|
+| 1 | Usuário | Cria o usuário no grupo `sudo` e define a senha. |
+| 2 | Timezone | `America/Sao_Paulo` + NTP. |
+| 3 | Atualizar sistema | Desativa o repositório Monarx (Hostinger) se existir; `full-upgrade`; instala curl, ufw, iptables. |
+| 4 | Atualizações automáticas | `unattended-upgrades` só com repositórios de **segurança**. Nunca reinicia sozinho; o login mostra `*** System restart required ***` quando precisar. |
+| 5 | Sysctl | Ver [tabela abaixo](#sysctl). Limites de 1M file descriptors e core dump desligado. |
+| 6 | Módulos do kernel | Bloqueia dccp, sctp, rds, tipc, cramfs, freevxfs, jffs2, hfs, hfsplus, udf (CIS). |
+| 7 | SWAP | Remove swaps antigos, cria `/swap/swapfile` com `fallocate`. |
+| 8 | Chave SSH | Grava a chave em `~/.ssh/authorized_keys` do usuário. |
+| 9 | Tailscale | Instala, conecta (navegador ou auth key) e **exige confirmar** que a expiração da chave foi desativada no painel. |
+| 10 | SSH | Grava `/etc/ssh/sshd_config.d/00-hardening.conf`, valida com `sshd -T`, reinicia via `ssh.socket` e **pede para você testar o login em outro terminal**. Se não confirmar, desfaz tudo. |
+| 11 | Firewall | UFW: bloqueia entrada, libera Tailscale e 80/443 (Cloudflare ou público). Instala o atualizador semanal dos IPs da Cloudflare. |
+| 12 | Docker *(opcional)* | Repositório oficial, `daemon.json` seguro e firewall DOCKER-USER persistente. |
+| 13 | Logs | journald persistente, máx. 500 MB / 3 meses. |
+
+Ao final grava `/root/server-info.txt` e pergunta se pode reiniciar.
+
+#### SSH
+
+Configuração efetiva (arquivo `00-hardening.conf`, lido antes de qualquer outro):
+
+- `ListenAddress` só em `127.0.0.1` e nos IPs do Tailscale; `Port 22`
+- `PermitRootLogin no`, `AllowUsers <usuário>`, `AuthenticationMethods publickey`
+- `PasswordAuthentication no`, `KbdInteractiveAuthentication no`
+- `MaxAuthTries 3`, `LoginGraceTime 30`, `MaxSessions 10`
+- `KexAlgorithms` montado a partir do que o OpenSSH suporta: `mlkem768x25519-sha256` (OpenSSH 10, pós-quântico), `sntrup761x25519-sha512`, `curve25519-sha256`
+- Apenas host key ed25519; ciphers AEAD (chacha20, aes-gcm); MACs etm
+
+Outros arquivos em `sshd_config.d/` (cloud-init, imagem da VPS) são renomeados para `.disabled`.
+Backup completo em `/root/ssh-backup-<data>/`.
+
+No Ubuntu 24.04+ o SSH usa *socket activation*: o `ssh.socket` é gerado a partir de `ListenAddress`/`Port`
+(com `FreeBind=yes`, então funciona mesmo se o Tailscale subir depois do SSH no boot). Por isso o script faz
+`systemctl daemon-reload && systemctl restart ssh.socket`.
+
+#### Sysctl
+
+Arquivo `/etc/sysctl.d/90-hardening.conf` (+ `91-conntrack.conf`):
+
+| Grupo | Parâmetros |
+|---|---|
+| Kernel | `kernel.dmesg_restrict=1`, `kernel.kptr_restrict=2`, `fs.suid_dumpable=0` |
+| Anti-spoofing / redirects | `rp_filter=1`, `accept_redirects=0`, `secure_redirects=0`, `send_redirects=0`, `accept_source_route=0` (IPv4 e IPv6) |
+| SYN flood | `tcp_syncookies=1`, `tcp_synack_retries=2`, `tcp_rfc1337=1` |
+| Desempenho | `somaxconn=4096`, `tcp_max_syn_backlog=8192`, buffers 16 MB, `tcp_tw_reuse=1`, `tcp_fin_timeout=15`, `tcp_fastopen=3`, `ip_local_port_range=10240 65535`, BBR + fq |
+| Arquivos / memória | `fs.file-max=2097152`, `inotify.max_user_watches=524288`, `inotify.max_user_instances=1024`, `vm.swappiness=10` |
+| Conntrack | `nf_conntrack_max=1048576`, timeouts curtos (syn_recv/time_wait 15 s) |
+
+**Intencionalmente fora:** `net.ipv4.ip_forward` (Docker e Tailscale precisam de `1`) e `tcp_timestamps=0` (anularia o `tcp_tw_reuse`).
+
+### Checkpoint, erros e logs
+
+- Cada fase concluída é gravada em `.startup-checkpoint`. Rodar de novo oferece **continuar de onde parou**.
+- A configuração para retomar fica em `.startup-config` (permissão 600, valores escapados com `printf %q`). Senha e auth key **não** são gravadas: se a fase do usuário ainda não rodou, a senha é pedida de novo.
+- `set -Eeuo pipefail` + `trap ERR`: qualquer comando que falhar para o script e mostra linha e comando.
+- Logs em `Ubuntu/logs/startup-<data>.log` e `startup-errors.log`.
+- Checkpoint e configuração são apagados ao final.
 
 ---
 
-### Por que DOCKER-USER?
+## Firewall: UFW, DOCKER-USER e Cloudflare
 
-O Docker **bypassa o UFW** para tráfego de containers — ele injeta regras diretamente em `iptables FORWARD`. Isso significa que o UFW sozinho não protege containers. A chain `DOCKER-USER` é executada **antes** das regras do Docker no `FORWARD`, sendo o único ponto de controle confiável.
+### Cloudflare-only
+
+`/usr/local/bin/cloudflare-update-firewall.sh`:
+
+1. Baixa `https://www.cloudflare.com/ips-v4` e `ips-v6`.
+2. Valida: só aceita linhas no formato CIDR e exige pelo menos 5 faixas IPv4 e 3 IPv6. Lista suspeita → **nada é alterado**.
+3. Se a lista mudou (ou com `--force`): remove regras públicas de 80/443, remove faixas que saíram, adiciona as atuais com comentário `Cloudflare`.
+4. Grava a lista em `/etc/cloudflare-ips.txt` e reaplica o DOCKER-USER.
+
+Roda toda semana pelo `cloudflare-update-firewall.timer`. Manual: `sudo cloudflare-update-firewall.sh --force`.
+
+### DOCKER-USER
+
+`/usr/local/bin/docker-user-firewall.sh` (serviço `docker-user-firewall`, roda no boot e sempre que o Docker reinicia):
 
 ```
-Internet → eth0 → FORWARD chain → DOCKER-USER (nosso controle) → DOCKER-FORWARD → container
-                                                                  ↑
-                                                        UFW não chega aqui
+1. ESTABLISHED,RELATED            → ACCEPT
+2. entrada por tailscale0         → ACCEPT
+3. interface pública, porta original 80/443
+   de IP da Cloudflare (ou de todos, sem a lista) → ACCEPT
+4. interface pública              → DROP
+5. resto (tráfego entre containers) → RETURN
 ```
 
----
+- A interface pública é detectada pela rota default (não fica fixa em `eth0`).
+- As regras usam `-m conntrack --ctorigdstport`, que é a porta **publicada no host**. `--dport` veria a porta interna do container depois do DNAT: um `8080:80` passaria e um `80:3000` seria bloqueado.
+- Aplicado em `iptables` e `ip6tables`.
 
-### Etapa 1/3 — Docker Engine
-
-- Pergunta se deseja instalar o Docker
-- Instala via repositório oficial apt:
-  - `docker-ce`, `docker-ce-cli`, `containerd.io`, `docker-buildx-plugin`, `docker-compose-plugin`
-- Habilita e inicia `docker.service`
-- Adiciona usuário `ubuntu` ao grupo docker (se existir)
-- Cria `/etc/docker/daemon.json`:
+### daemon.json
 
 ```json
 {
   "ip": "127.0.0.1",
+  "no-new-privileges": true,
+  "live-restore": true,
   "log-driver": "json-file",
   "log-opts": { "max-size": "10m", "max-file": "3" }
 }
 ```
 
-`"ip": "127.0.0.1"` faz containers sem bind explícito bindarem em localhost — não ficam expostos. Complementa o DOCKER-USER para containers com bind `0.0.0.0` (como Traefik).
-
----
-
-### Etapa 2/3 — Script DOCKER-USER
-
-Cria `/usr/local/bin/docker-user-firewall.sh` com a lógica de firewall:
-
-```bash
-# Regras aplicadas (em ordem):
-1. ESTABLISHED,RELATED → ACCEPT    # respostas a conexões iniciadas por você
-2. tailscale0 → ACCEPT             # tudo via Tailscale VPN
-3. IPs Cloudflare :80 → ACCEPT     # lidos do UFW (se 03 já rodou)
-   IPs Cloudflare :443 → ACCEPT    # fallback: abre para todos se UFW sem CF
-4. eth0 → DROP                     # bloqueia todo o resto da internet
-5. RETURN                          # tráfego interno entre containers: normal
-```
-
-**Lógica de IPs Cloudflare:**
-O script lê os IPs diretamente do que o UFW já tem registrado (comentário `Cloudflare`). Não faz requisições à internet no boot. Se `03` ainda não rodou, o UFW não tem IPs Cloudflare → fallback abre 80/443 para todos temporariamente.
-
----
-
-### Etapa 3/3 — Serviço systemd
-
-Cria e habilita `docker-user-firewall.service`:
-- `After=docker.service` → executa após Docker iniciar
-- `Type=oneshot` + `RemainAfterExit=yes` → roda uma vez, permanece "ativo"
-- Garante que as regras sejam reaplicadas em todo reboot
-
----
-
-## 03-cloudflare-update-ufw.sh — Cloudflare IP Updater
-
-### Visão Geral
-
-Atualiza os IPs da Cloudflare no UFW e no DOCKER-USER, ativando o modo Cloudflare-Only. Após a primeira execução, acesso direto por IP às portas 80/443 é bloqueado no nível de rede.
-
-```bash
-sudo bash 03-cloudflare-update-ufw.sh
-```
-
----
-
-### Funcionamento
-
-**1. Pergunta inicial** — confirma se deseja verificar/atualizar IPs.
-
-**2. Busca IPs oficiais da Cloudflare:**
-```
-https://www.cloudflare.com/ips-v4  → 15 ranges IPv4
-https://www.cloudflare.com/ips-v6  → 7 ranges IPv6
-```
-
-**3. Lê regras Cloudflare atuais do UFW** — extrai IPs de regras com comentário `Cloudflare`.
-
-**4. Calcula diff** — IPs a adicionar e IPs obsoletos a remover.
-
-**5. Exibe resumo detalhado** antes de qualquer ação.
-
-**6. Pede confirmação** — só aplica após `s` explícito.
-
-**7. Remove regras públicas** — garante que 80/443 só aceitem Cloudflare.
-
-**8. Remove IPs obsoletos** + **adiciona IPs novos** no UFW.
-
-**9. Atualiza DOCKER-USER** — reinicia `docker-user-firewall.service`, que lê os novos IPs do UFW e reaplicaca todas as regras.
-
-**10. Pergunta sobre timer mensal** — se ainda não existir, oferece criar atualização automática.
-
----
-
-### Modo Cloudflare-Only: como funciona
-
-Após rodar o `03`, qualquer acesso que **não venha de um IP Cloudflare** é dropado no `DOCKER-USER` antes de chegar nos containers:
-
-| Origem | Porta | Resultado |
-|---|---|---|
-| IP Cloudflare | 80 ou 443 | ACCEPT → chega no Traefik |
-| IP qualquer direto | 80 ou 443 | DROP no DOCKER-USER |
-| IP qualquer direto | qualquer outra | DROP no DOCKER-USER |
-| Tailscale VPN | qualquer | ACCEPT → acesso total |
-
----
-
-### Timer Mensal Automático (opcional)
-
-Ao final da execução, o script oferece criar:
-
-| Arquivo | Função |
+| Opção | Efeito |
 |---|---|
-| `/usr/local/bin/cloudflare-update-firewall.sh` | Script não-interativo (sem prompts) |
-| `cloudflare-update-firewall.service` | Executa o script via systemd |
-| `cloudflare-update-firewall.timer` | Dispara mensalmente, `Persistent=true` |
+| `ip: 127.0.0.1` | `-p 9443:9443` escuta só no localhost. Para expor, diga o IP: `0.0.0.0:443:443` (Traefik) ou `100.x.x.x:9443:9443` (painel via Tailscale). |
+| `no-new-privileges` | Processos no container não ganham privilégio via setuid. Imagens que dependem de `sudo` interno podem precisar de `security_opt: ["no-new-privileges=false"]`. |
+| `live-restore` | Containers continuam rodando quando o daemon do Docker atualiza/reinicia. |
+| log-opts | Máximo 30 MB de log por container. |
 
-`Persistent=true` garante que, se a VPS estiver desligada no dia agendado, o timer roda na próxima vez que ligar.
-
-**Quando rodar o `03` manualmente no futuro**, o `docker-user-firewall.service` é reiniciado automaticamente — não é preciso rodar nenhum script adicional.
+O usuário SSH **não** é adicionado ao grupo `docker` (equivale a root sem senha). Use `sudo docker ...`.
 
 ---
 
-## _audit.sh — Auditoria de Saúde
+## _audit.sh
 
-### Visão Geral
-
-Valida se todas as configurações dos scripts anteriores foram aplicadas corretamente. Gera relatório com score percentual e log datado.
+Somente leitura. Rode após o reboot e periodicamente:
 
 ```bash
 sudo bash _audit.sh
 ```
 
----
-
-### Seções Verificadas
-
-| Seção | Verificações |
+| Seção | Verifica |
 |---|---|
-| Sistema Base | Timezone, NTP, SWAP, Unattended Upgrades |
-| Kernel/sysctl | 17+ parâmetros de segurança e performance |
-| Módulos de Kernel | 9 módulos bloqueados (opcional) |
-| SSH Hardening | PasswordAuth, PubkeyAuth, PermitRootLogin, ListenAddress, criptografia, cloud-init |
-| Tailscale VPN | Instalado, serviço ativo, conectado |
-| Firewall UFW | Ativo, DENY incoming, IPv6, logging medium, Tailscale liberado, IPs Cloudflare |
-| Fail2Ban | Instalado, serviço ativo, jail sshd |
-| Auditd | Instalado, serviço ativo, regras carregadas (opcional) |
-| Docker | Instalado, serviço ativo, daemon.json bind 127.0.0.1, API não exposta |
-| DOCKER-USER Firewall | Serviço enabled + ativo, chain com regras, modo Cloudflare-Only, timer mensal |
-| Logging | Journald limite, rsyslog |
-| Exposição de Portas | Portas inesperadas abertas, SSH no IP público |
+| Sistema | Versão do Ubuntu, timezone, NTP, swap, unattended-upgrades, reboot automático desligado, **reboot pendente** |
+| Sysctl | Todos os parâmetros da tabela, `ip_forward` não fixado em 0, `tcp_timestamps` ligado, BBR, conntrack, file descriptors |
+| Módulos | Os 10 módulos bloqueados |
+| SSH | Configuração **efetiva** (`sshd -T`): senha off, root off, AllowUsers, escuta só em IPs específicos, Kex pós-quântico, overrides em `sshd_config.d`, Fail2Ban com ban permanente |
+| Tailscale | Instalado, conectado, **expiração da chave desativada** |
+| UFW | Ativo, deny padrão, IPv6, Tailscale liberado, nada além de 80/443, modo Cloudflare e timer |
+| Docker | `daemon.json` (bind, no-new-privileges, live-restore, logs), API não exposta, backend nftables |
+| DOCKER-USER | Serviço ativo, DROP na interface pública, uso de `ctorigdstport`, regras Cloudflare, IPv6, containers publicando em `0.0.0.0` |
+| Logs | journald com limite e persistente |
+| Exposição | SSH no IP público, serviços do host escutando em todos os IPs |
 
-### Output
-
-```
-✅ PASS  72/75 verificações
-❌ FAIL  0 verificações críticas
-⚠️  WARN  3 avisos (opcionais/menores)
-
-Score: 96% — Excelente
-```
-
-- Exit code `0` → sem FAILs
-- Exit code `1` → há FAILs críticos
-- Log salvo em `logs/audit-YYYYMMDD_HHMMSS.log`
+Saída: PASS / FAIL / WARN por item, score e log em `Ubuntu/logs/audit-<data>.log`. Código de saída 1 se houver FAIL.
 
 ---
 
-## Serviços systemd
+## Arquivos e serviços criados
 
-### `docker-user-firewall.service`
-- **Criado por:** `02-docker.sh`
-- **Script:** `/usr/local/bin/docker-user-firewall.sh`
-- **Executa:** no boot, após `docker.service`
-- **Lógica:** lê IPs Cloudflare do UFW, aplica `DOCKER-USER`
+| Arquivo | Conteúdo |
+|---|---|
+| `/etc/ssh/sshd_config.d/00-hardening.conf` | Configuração SSH |
+| `/root/ssh-backup-<data>/` | Backup do SSH antes da mudança |
+| `/etc/sysctl.d/90-hardening.conf`, `91-conntrack.conf` | Kernel e rede |
+| `/etc/security/limits.d/90-hardening.conf` | nofile e core dump |
+| `/etc/systemd/system.conf.d/90-nofile.conf` | `DefaultLimitNOFILE` |
+| `/etc/modules-load.d/tcp_bbr.conf`, `nf_conntrack.conf` | Módulos carregados no boot |
+| `/etc/modprobe.d/blacklist-hardening.conf` | Módulos bloqueados |
+| `/etc/apt/apt.conf.d/52unattended-upgrades-hardening`, `20auto-upgrades` | Atualizações automáticas |
+| `/swap/swapfile` | SWAP |
+| `/etc/systemd/journald.conf.d/90-hardening.conf` | Logs |
+| `/etc/cloudflare-ips.txt` | Faixas Cloudflare aplicadas |
+| `/usr/local/bin/cloudflare-update-firewall.sh` | Atualizador Cloudflare |
+| `/usr/local/bin/docker-user-firewall.sh` | Regras DOCKER-USER |
+| `/etc/docker/daemon.json` | Configuração do Docker |
+| `/root/server-info.txt` | Resumo final |
 
-### `cloudflare-update-firewall.service`
-- **Criado por:** `03-cloudflare-update-ufw.sh` (opcional)
-- **Script:** `/usr/local/bin/cloudflare-update-firewall.sh`
-- **Executa:** chamado pelo timer
-
-### `cloudflare-update-firewall.timer`
-- **Criado por:** `03-cloudflare-update-ufw.sh` (opcional)
-- **Dispara:** mensalmente, `Persistent=true`
-- **Efeito:** atualiza UFW + reinicia `docker-user-firewall.service`
-
-```
-Boot:
-  docker.service → docker-user-firewall.service
-                        ↓ lê IPs do UFW → aplica DOCKER-USER
-
-Mensalmente:
-  cloudflare-update-firewall.timer
-    → cloudflare-update-firewall.service
-        → atualiza UFW com IPs Cloudflare
-        → reinicia docker-user-firewall.service
-            → DOCKER-USER reaplica com IPs atualizados
-```
+| Serviço systemd | Quando roda |
+|---|---|
+| `docker-user-firewall.service` | Boot e todo restart do Docker (`PartOf=docker.service`) |
+| `cloudflare-update-firewall.service` | Chamado pelo timer |
+| `cloudflare-update-firewall.timer` | Semanal (com atraso aleatório de até 6 h) |
 
 ---
 
-## Arquivos Gerados
+## Decisões de projeto
 
-### pelo 01-startup.sh
-
-| Arquivo | Descrição |
+| Decisão | Motivo |
 |---|---|
-| `logs/startup-YYYYMMDD.log` | Log completo de execução |
-| `logs/startup-errors.log` | Apenas erros |
-| `/root/server-info.txt` | Resumo de acesso e configuração |
-| `/etc/sysctl.d/60-net.conf` | Parâmetros de rede e performance |
-| `/etc/sysctl.d/60-conntrack.conf` | Parâmetros do conntrack |
-| `/etc/sysctl.d/60-aslr.conf` | ASLR |
-| `/etc/sysctl.d/60-yama.conf` | ptrace |
-| `/etc/sysctl.d/60-coredump.conf` | Core dumps |
-| `/etc/modules-load.d/nf_conntrack.conf` | Carga do conntrack no boot |
-| `/etc/modprobe.d/blacklist-hardening.conf` | Módulos de kernel bloqueados |
-| `/etc/ssh/sshd_config.backup.*` | Backup datado do SSH original |
-| `/etc/fail2ban/jail.local` | Jails do Fail2Ban |
-| `/etc/audit/rules.d/hardening.rules` | Regras do Auditd |
-| `/swap/swapfile` | Arquivo de swap |
-
-### pelo 02-docker.sh
-
-| Arquivo | Descrição |
-|---|---|
-| `/etc/docker/daemon.json` | Configuração do Docker daemon (bind 127.0.0.1) |
-| `/usr/local/bin/docker-user-firewall.sh` | Script de regras DOCKER-USER |
-| `/etc/systemd/system/docker-user-firewall.service` | Serviço systemd |
-
-### pelo 03-cloudflare-update-ufw.sh
-
-| Arquivo | Descrição |
-|---|---|
-| `/usr/local/bin/cloudflare-update-firewall.sh` | Script não-interativo (timer) |
-| `/etc/systemd/system/cloudflare-update-firewall.service` | Serviço systemd |
-| `/etc/systemd/system/cloudflare-update-firewall.timer` | Timer mensal |
+| Sem login root via SSH | Usuário nomeado + sudo deixa rastro de quem fez o quê e exige senha para privilégio. |
+| Porta SSH 22 | O SSH não existe no IP público; porta alternativa não protege nada dentro da VPN. |
+| Sem Fail2Ban | Só dispositivos do Tailscale alcançam o SSH. O Fail2Ban só poderia banir o próprio administrador (a versão antiga usava ban permanente). |
+| Sem auditd | Os logins e o uso de `sudo` já ficam no journald. Auditd só compensa com exigência de compliance (PCI, ISO, SOC2) e alguém revisando. |
+| Sem reboot automático | O servidor nunca reinicia sozinho; o aviso aparece no login e no `_audit.sh`. |
+| Observabilidade fora do script | Grafana/Loki/Alloy são aplicações: sobem como stack no Portainer, versionadas em Git. O script só garante journald persistente e rotação de logs do Docker. |
 
 ---
 
-## Fluxo de Execução Recomendado
+## Recuperação de acesso
 
-```
-1. Provisionar VPS Ubuntu 22.04 ou 24.04
+Se o Tailscale cair ou a chave expirar, o SSH fica inacessível. Para entrar:
 
-2. Acessar via console web ou SSH como root
+1. Painel da Hostinger → VPS → **Console / Terminal do navegador**.
+2. Login com o usuário (`ubuntu`) e a **senha definida no script**.
+3. `sudo tailscale up` (e desative a expiração da chave no painel do Tailscale).
 
-3. git clone https://github.com/andreluizfaustino/devsecops-vps-startup.git
-   cd devsecops-vps-startup/Ubuntu
-
-4. sudo bash 01-startup.sh
-   → Configurar interativamente (usuário, porta, swap, chave SSH, opcionais)
-   → Autenticar Tailscale no navegador quando solicitado
-   → Aguardar reboot automático (~4 min)
-
-5. Conectar via Tailscale
-   ssh ubuntu@<IP_TAILSCALE> -p <PORTA>
-
-6. sudo bash 02-docker.sh
-   → Confirmar instalação do Docker
-   → Docker instalado + DOCKER-USER configurado + serviço systemd ativo
-
-7. sudo bash 03-cloudflare-update-ufw.sh
-   → Confirmar atualização de IPs
-   → IPs Cloudflare aplicados no UFW + DOCKER-USER
-   → Configurar timer mensal (recomendado: S)
-   → A partir daqui: acesso direto por IP às portas 80/443 é bloqueado
-
-8. sudo bash _audit.sh
-   → Validar score (esperado: ~96-97%)
-
-Manutenção futura:
-   → Atualizar IPs Cloudflare: sudo bash 03-cloudflare-update-ufw.sh
-   → Health check:             sudo bash _audit.sh
-   → Logs do firewall:         journalctl -u docker-user-firewall.service
-   → Logs do timer mensal:     journalctl -u cloudflare-update-firewall.service
-   → Nova VPS: git pull && repetir passos 4-8
-```
+Último recurso: reinstalar o SO pelo painel e rodar o `01-startup.sh` de novo.

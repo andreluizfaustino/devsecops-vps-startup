@@ -1,0 +1,6 @@
+.DS_Store
+
+# Gerados ao rodar os scripts no servidor
+Ubuntu/logs/
+Ubuntu/.startup-checkpoint
+Ubuntu/.startup-config
