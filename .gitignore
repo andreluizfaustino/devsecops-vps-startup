@@ -4,3 +4,6 @@
 Ubuntu/logs/
 Ubuntu/.startup-checkpoint
 Ubuntu/.startup-config
+
+# Stacks: valores locais de cada servidor
+stacks/*/.env

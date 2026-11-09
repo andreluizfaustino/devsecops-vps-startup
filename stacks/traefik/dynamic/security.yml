@@ -1,0 +1,40 @@
+# Proteções globais (aplicadas pela entrada websecure em traefik.yml)
+http:
+  middlewares:
+
+    # Corrente aplicada a todas as aplicações
+    default-secure:
+      chain:
+        middlewares:
+          - rate-limit
+          - secure-headers
+          - body-limit
+
+    # Limite por visitante (IP real vindo da Cloudflare).
+    # Segunda barreira: a Cloudflare já limita 150 req/10s por IP.
+    rate-limit:
+      rateLimit:
+        average: 30          # requisições por segundo, em média
+        burst: 100           # pico tolerado
+        period: 1s
+        sourceCriterion:
+          requestHeaderName: Cf-Connecting-Ip
+
+    # Cabeçalhos de segurança nas respostas
+    secure-headers:
+      headers:
+        stsSeconds: 31536000             # HSTS: 1 ano, só HTTPS
+        stsIncludeSubdomains: true
+        contentTypeNosniff: true
+        customFrameOptionsValue: SAMEORIGIN
+        referrerPolicy: strict-origin-when-cross-origin
+        permissionsPolicy: "camera=(), microphone=(), geolocation=()"
+        customResponseHeaders:
+          Server: ""                     # não revela o software do servidor
+          X-Powered-By: ""
+
+    # Tamanho máximo de requisição (uploads). Acima disso: 413.
+    body-limit:
+      buffering:
+        maxRequestBodyBytes: 10485760    # 10 MB
+        memRequestBodyBytes: 2097152     # até 2 MB fica em memória

@@ -470,6 +470,7 @@ save_config() {
             printf 'INSTALL_DOCKER=%q\n' "$INSTALL_DOCKER"
             printf 'TAILSCALE_IPV4=%q\n' "$TAILSCALE_IPV4"
             printf 'TAILSCALE_IPV6=%q\n' "$TAILSCALE_IPV6"
+            printf 'START_TIME=%q\n' "$START_TIME"   # tempo total conta desde a 1ª execução
         } > "$CONFIG_FILE"
     )
 }
@@ -612,6 +613,12 @@ fs.nr_open = 2097152
 fs.inotify.max_user_watches = 524288
 fs.inotify.max_user_instances = 1024
 vm.swappiness = 10
+
+# ── Portas no IP do Tailscale ────────────────────────────
+# Permite que containers publiquem portas no IP do Tailscale (ex.: Portainer
+# em 100.x.y.z:9443) mesmo quando o Docker sobe antes do Tailscale no boot.
+net.ipv4.ip_nonlocal_bind = 1
+net.ipv6.ip_nonlocal_bind = 1
 EOF
 
     # BBR (carregado no boot antes do sysctl)

@@ -148,6 +148,7 @@ check_sysctl() {
         "fs.file-max:2097152"
         "fs.inotify.max_user_watches:524288"
         "vm.swappiness:10"
+        "net.ipv4.ip_nonlocal_bind:1"
     )
     local param key expected actual
     for param in "${params[@]}"; do

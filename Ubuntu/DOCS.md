@@ -112,6 +112,7 @@ Arquivo `/etc/sysctl.d/90-hardening.conf` (+ `91-conntrack.conf`):
 | SYN flood | `tcp_syncookies=1`, `tcp_synack_retries=2`, `tcp_rfc1337=1` |
 | Desempenho | `somaxconn=4096`, `tcp_max_syn_backlog=8192`, buffers 16 MB, `tcp_tw_reuse=1`, `tcp_fin_timeout=15`, `tcp_fastopen=3`, `ip_local_port_range=10240 65535`, BBR + fq |
 | Arquivos / memória | `fs.file-max=2097152`, `inotify.max_user_watches=524288`, `inotify.max_user_instances=1024`, `vm.swappiness=10` |
+| Portas no Tailscale | `ip_nonlocal_bind=1` (IPv4 e IPv6): containers podem publicar portas no IP do Tailscale mesmo se o Docker subir antes dele no boot |
 | Conntrack | `nf_conntrack_max=1048576`, timeouts curtos (syn_recv/time_wait 15 s) |
 
 **Intencionalmente fora:** `net.ipv4.ip_forward` (Docker e Tailscale precisam de `1`) e `tcp_timestamps=0` (anularia o `tcp_tw_reuse`).

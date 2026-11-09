@@ -78,11 +78,14 @@ Sem essa proteção, um `-p 9443:9443` fica aberto para a internet mesmo com o U
 
 ## Depois do setup
 
-O script não instala aplicações. Próximos passos sugeridos (via Docker/Portainer):
+O script não instala aplicações. A camada seguinte está pronta em **[`../stacks/`](../stacks/README.md)**:
 
-- **Traefik** — publique `"0.0.0.0:80:80"` e `"0.0.0.0:443:443"` explicitamente (o padrão do Docker aqui é `127.0.0.1`).
-- **Portainer, Grafana e painéis** — publique no IP do Tailscale, ex.: `"100.x.x.x:9443:9443"`.
-- **Observabilidade** — stack Grafana + Loki + Alloy pelo Portainer (lê o journald e os logs dos containers).
+- **Traefik** (+ socket-proxy): certificado de Origem da Cloudflare, IP real do visitante, rate limit, cabeçalhos de segurança e limite de upload aplicados a todas as aplicações.
+- **Portainer**: só pelo Tailscale.
+
+Regras para as suas aplicações:
+- Públicas: rede `proxy` + labels do Traefik, sem `ports:`.
+- Painéis administrativos: publique no IP do Tailscale, ex.: `"100.x.x.x:9443:9443"` (o script já habilita `ip_nonlocal_bind` para isso funcionar no boot).
 
 ---
 

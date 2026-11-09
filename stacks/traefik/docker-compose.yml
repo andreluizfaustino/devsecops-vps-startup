@@ -1,0 +1,62 @@
+# Traefik — proxy reverso
+#   80/443   : públicos (o firewall só deixa a Cloudflare chegar)
+#   8080     : painel do Traefik, SOMENTE pelo Tailscale
+#   O Traefik NÃO acessa o docker.sock: fala com o socket-proxy, que só
+#   permite leitura de containers e eventos.
+services:
+  socket-proxy:
+    image: lscr.io/linuxserver/socket-proxy:3.4.7
+    container_name: socket-proxy
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /run
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      # Liberado (somente leitura, o mínimo que o Traefik precisa)
+      - CONTAINERS=1
+      - EVENTS=1
+      - PING=1
+      - VERSION=1
+      # Bloqueado: qualquer escrita (criar, parar, apagar, exec...)
+      - POST=0
+      - ALLOW_START=0
+      - ALLOW_STOP=0
+      - ALLOW_RESTARTS=0
+      - EXEC=0
+      - IMAGES=0
+      - NETWORKS=0
+      - VOLUMES=0
+      - INFO=0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - socket-proxy
+
+  traefik:
+    image: traefik:v3.7
+    container_name: traefik
+    restart: unless-stopped
+    depends_on:
+      - socket-proxy
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "0.0.0.0:80:80"            # explícito: o padrão do Docker aqui é 127.0.0.1
+      - "0.0.0.0:443:443"
+      - "${TS_IP}:8080:8080"       # painel: só Tailscale
+    networks:
+      - proxy
+      - socket-proxy
+    volumes:
+      - ./traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./dynamic:/etc/traefik/dynamic:ro
+      - ./certs:/certs:ro
+
+networks:
+  proxy:
+    external: true
+  socket-proxy:
+    name: socket-proxy
+    internal: true                 # sem acesso à internet, só Traefik <-> proxy

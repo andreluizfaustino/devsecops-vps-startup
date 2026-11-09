@@ -1,0 +1,13 @@
+# Certificado de Origem da Cloudflare (válido só atrás do proxy, 15 anos)
+tls:
+  certificates:
+    - certFile: /certs/origin.pem
+      keyFile: /certs/origin.key
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /certs/origin.pem
+        keyFile: /certs/origin.key
+  options:
+    default:
+      minVersion: VersionTLS12
