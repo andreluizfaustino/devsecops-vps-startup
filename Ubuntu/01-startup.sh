@@ -55,17 +55,50 @@ APT_GET=(apt-get -y -q -o DPkg::Lock::Timeout=600 -o Acquire::Retries=3
          -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
 APT_IPV4_CONF="/etc/apt/apt.conf.d/99force-ipv4"
 
-# apt com fallback para IPv4: algumas VPS têm IPv6 de saída quebrado e o apt
-# não troca sozinho de protocolo. Se o IPv4 resolver, fica gravado para o
-# unattended-upgrades também funcionar.
+UBUNTU_SOURCES="/etc/apt/sources.list.d/ubuntu.sources"
+UBUNTU_MIRRORS=(br.archive.ubuntu.com us.archive.ubuntu.com de.archive.ubuntu.com mirrors.edge.kernel.org)
+
+# Algumas redes de VPS não alcançam o archive.ubuntu.com (timeout), mas alcançam
+# os espelhos oficiais. Se o servidor configurado não responder, troca pelo
+# primeiro espelho que responder. Retorna 0 se trocou.
+switch_ubuntu_mirror_if_needed() {
+    [ -f "$UBUNTU_SOURCES" ] || return 1
+    local current m
+    current=$(awk '/^URIs:/ {print $2; exit}' "$UBUNTU_SOURCES")
+    [ -n "$current" ] || return 1
+    if curl -s -o /dev/null -m 8 "$current/"; then
+        return 1   # servidor atual responde: nada a fazer
+    fi
+    for m in "${UBUNTU_MIRRORS[@]}"; do
+        if curl -s -o /dev/null -m 8 "http://$m/ubuntu/"; then
+            [ -f "$UBUNTU_SOURCES.orig" ] || cp "$UBUNTU_SOURCES" "$UBUNTU_SOURCES.orig"
+            sed -i -E "s#^URIs: +http://[^ ]*archive\.ubuntu\.com/ubuntu/?\$#URIs: http://$m/ubuntu/#" "$UBUNTU_SOURCES"
+            log WARNING "$current não responde — usando o espelho oficial http://$m/ubuntu/"
+            return 0
+        fi
+    done
+    log WARNING "$current não responde e nenhum espelho alternativo respondeu"
+    return 1
+}
+
+# apt com recuperação automática:
+#   1) servidor da Ubuntu inacessível → troca de espelho e repete
+#   2) ainda falhando → repete forçando IPv4 (algumas VPS têm IPv6 de saída quebrado);
+#      se resolver, grava a opção para o unattended-upgrades também usar IPv4
 apt_run() {
     if "${APT_GET[@]}" "$@" >> "$LOG_FILE" 2>&1; then
         return 0
     fi
+    if switch_ubuntu_mirror_if_needed; then
+        [ "$1" = "update" ] || "${APT_GET[@]}" update >> "$LOG_FILE" 2>&1 || true
+        if "${APT_GET[@]}" "$@" >> "$LOG_FILE" 2>&1; then
+            return 0
+        fi
+    fi
     if [ -f "$APT_IPV4_CONF" ]; then
         return 1
     fi
-    log WARNING "apt falhou ($*) — tentando de novo forçando IPv4 (IPv6 desta VPS pode estar instável)"
+    log WARNING "apt falhou ($*) — tentando de novo forçando IPv4"
     if "${APT_GET[@]}" -o Acquire::ForceIPv4=true "$@" >> "$LOG_FILE" 2>&1; then
         echo 'Acquire::ForceIPv4 "true";  // gerado por 01-startup.sh: IPv6 de saída instável' > "$APT_IPV4_CONF"
         log WARNING "IPv4 funcionou — apt fixado em IPv4 ($APT_IPV4_CONF)"
@@ -490,6 +523,7 @@ phase_system_update() {
         fi
     done
 
+    switch_ubuntu_mirror_if_needed || true
     run_step "Atualizando a lista de pacotes"         apt_run update
     run_step "Baixando e instalando atualizações"      apt_run full-upgrade
     run_step "Instalando ferramentas base"             apt_run install curl ca-certificates gnupg ufw iptables
@@ -1027,6 +1061,7 @@ phase_docker() {
     fi
 
     if ! command -v docker &>/dev/null; then
+        switch_ubuntu_mirror_if_needed || true
         log INFO "Adicionando repositório oficial do Docker..."
         install -m 0755 -d /etc/apt/keyrings
         curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
