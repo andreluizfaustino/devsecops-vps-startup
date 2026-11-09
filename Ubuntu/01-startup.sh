@@ -51,7 +51,7 @@ DU_SCRIPT="/usr/local/bin/docker-user-firewall.sh"
 # apt sem perguntas e esperando o lock do dpkg (VPS recém-criada costuma estar atualizando)
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
-APT_GET=(apt-get -y -qq -o DPkg::Lock::Timeout=600 -o Acquire::Retries=3
+APT_GET=(apt-get -y -q -o DPkg::Lock::Timeout=600 -o Acquire::Retries=3
          -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
 APT_IPV4_CONF="/etc/apt/apt.conf.d/99force-ipv4"
 
@@ -135,6 +135,43 @@ trap 'on_error $LINENO "$BASH_COMMAND"' ERR
 format_time() {
     local s=$1
     if [ "$s" -lt 60 ]; then echo "${s}s"; else echo "$((s / 60))m $((s % 60))s"; fi
+}
+
+# Executa uma etapa demorada mostrando que o script está vivo:
+#   ⠹ Baixando e instalando atualizações  (1m 12s)  Unpacking linux-image-7.0.0-43…
+# A última linha do log mostra a atividade real (pacote, download, erro de rede).
+# Uso: run_step "Descrição" comando args...
+run_step() {
+    local desc=$1; shift
+    local start rc=0 pid i=0 last
+    local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)   # array: funciona com qualquer locale
+    start=$(date +%s)
+    echo "--- $desc" >> "$LOG_FILE"
+
+    "$@" &
+    pid=$!
+
+    if [ -t 1 ]; then
+        while kill -0 "$pid" 2>/dev/null; do
+            last=$(tail -n 1 "$LOG_FILE" 2>/dev/null | tr -d '\r' | tr -s ' ' | cut -c1-55 || true)
+            [[ "$last" == "--- "* ]] && last=""
+            printf "\r\033[K  ${COLOR_CYAN}%s${COLOR_RESET} %s ${COLOR_BOLD}(%s)${COLOR_RESET} %s" \
+                "${frames[$((i % 10))]}" "$desc" "$(format_time $(( $(date +%s) - start )))" "${last:+ $last…}"
+            i=$((i + 1))
+            sleep 1
+        done
+        printf "\r\033[K"
+    else
+        echo "  … $desc"
+    fi
+
+    wait "$pid" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        log SUCCESS "$desc ($(format_time $(( $(date +%s) - start ))))"
+    else
+        log ERROR "$desc — falhou após $(format_time $(( $(date +%s) - start )))"
+    fi
+    return "$rc"
 }
 
 # ════════════════════════════════════════════════════════
@@ -453,17 +490,15 @@ phase_system_update() {
         fi
     done
 
-    log INFO "Atualizando pacotes (pode demorar)..."
-    apt_run update
-    apt_run full-upgrade
-    apt_run install curl ca-certificates gnupg ufw iptables
-    apt_run autoremove --purge
-    apt_run autoclean
-    log SUCCESS "Sistema atualizado"
+    run_step "Atualizando a lista de pacotes"         apt_run update
+    run_step "Baixando e instalando atualizações"      apt_run full-upgrade
+    run_step "Instalando ferramentas base"             apt_run install curl ca-certificates gnupg ufw iptables
+    run_step "Removendo pacotes que não são mais usados" apt_run autoremove --purge
+    run_step "Limpando cache do apt"                   apt_run autoclean
 }
 
 phase_unattended_upgrades() {
-    apt_run install unattended-upgrades update-notifier-common
+    run_step "Instalando unattended-upgrades" apt_run install unattended-upgrades update-notifier-common
 
     cat > /etc/apt/apt.conf.d/52unattended-upgrades-hardening << 'EOF'
 // Gerado por 01-startup.sh — apenas atualizações de SEGURANÇA, sem reboot automático
@@ -610,7 +645,8 @@ blacklist hfs
 blacklist hfsplus
 blacklist udf
 EOF
-    update-initramfs -u >> "$LOG_FILE" 2>&1 || log WARNING "update-initramfs falhou (efeito vale no próximo boot mesmo assim)"
+    _initramfs() { update-initramfs -u >> "$LOG_FILE" 2>&1; }
+    run_step "Atualizando initramfs" _initramfs || log WARNING "update-initramfs falhou (o bloqueio vale no próximo boot mesmo assim)"
     log SUCCESS "Módulos bloqueados: dccp, sctp, rds, tipc, cramfs, freevxfs, jffs2, hfs, hfsplus, udf"
 }
 
@@ -633,7 +669,8 @@ phase_swap() {
     mkdir -p /swap
     rm -f "$swapfile"
     if ! fallocate -l "${SWAP_SIZE}G" "$swapfile" 2>/dev/null; then
-        dd if=/dev/zero of="$swapfile" bs=1M count=$((SWAP_SIZE * 1024)) status=none
+        _dd_swap() { dd if=/dev/zero of="$swapfile" bs=1M count=$((SWAP_SIZE * 1024)) status=none; }
+        run_step "Criando arquivo de ${SWAP_SIZE} GB" _dd_swap
     fi
     chmod 600 "$swapfile"
     mkswap "$swapfile" >> "$LOG_FILE" 2>&1
@@ -660,7 +697,8 @@ phase_ssh_key() {
 phase_tailscale() {
     if ! command -v tailscale &>/dev/null; then
         log INFO "Instalando Tailscale (script oficial, repositório apt assinado)..."
-        curl -fsSL https://tailscale.com/install.sh | sh >> "$LOG_FILE" 2>&1
+        _ts_install() { curl -fsSL https://tailscale.com/install.sh | sh >> "$LOG_FILE" 2>&1; }
+        run_step "Instalando Tailscale" _ts_install
     fi
     systemctl enable --now tailscaled >> "$LOG_FILE" 2>&1
 
@@ -1002,9 +1040,9 @@ Components: stable
 Architectures: $(dpkg --print-architecture)
 Signed-By: /etc/apt/keyrings/docker.asc
 EOF
-        apt_run update
-        log INFO "Instalando Docker Engine..."
-        apt_run install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+        run_step "Atualizando a lista de pacotes" apt_run update
+        run_step "Instalando Docker Engine" \
+            apt_run install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
     fi
 
     # Padrões seguros:
